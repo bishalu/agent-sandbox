@@ -196,8 +196,15 @@ class LocalDockerBackend(SandboxBackend):
         timed_out = {"hit": False}
 
         def _kill():
-            """Hard wall-clock ceiling (R-03). Preserve the workspace."""
+            """Hard wall-clock ceiling (R-03). Preserve the workspace.
+
+            Stop first so the agent's own signal handlers can close their
+            traces (an SSSF run marks its session ended on SIGTERM), then
+            kill whatever is still up after the grace period (R-21).
+            """
             timed_out["hit"] = True
+            subprocess.run(["docker", "stop", "-t", "30", container_name],
+                           env=self._env, capture_output=True, text=True)
             subprocess.run(["docker", "kill", container_name],
                            env=self._env, capture_output=True, text=True)
 
