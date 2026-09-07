@@ -1,421 +1,86 @@
 # agent-sandbox
 
-Run coding agents against your repositories inside an isolated git worktree and
-a hardened, disposable rootless-Docker container. The container is thrown away;
-the work survives.
+Let a coding agent loose on your repository without letting it loose on your machine.
+
+`agent-sandbox .` gives the agent its own git worktree on its own branch, inside a hardened rootless-Docker container that is thrown away when it exits. The work survives on the branch. The container does not.
 
 ```bash
-agent-sandbox .                      # this repo's sandbox, resumed (or created)
-agent-sandbox . --new                # a fresh sandbox even if one exists
-agent-sandbox ~/code/app -- claude   # run Claude Code in a sandbox
-agent-sandbox . -- npm test          # one-shot command
+agent-sandbox .                      # this repo's sandbox: resumed if it exists, created if not
+agent-sandbox . -- claude            # Claude Code inside it
+agent-sandbox . -- npm test          # any one-shot command
+agent-sandbox . --new                # a second sandbox for the same repo
 ```
 
-No per-repository setup. Works on any repo you have now or add later, with no
-assumptions about language, test runner, or branch strategy.
+No per-repository setup, and no assumptions about language or test runner.
 
-## Architecture
+## What you get
 
-```
-your repo  (never modified)
-    │
-    ├─ git worktree ──► ~/agent-sandbox/worktrees/<sandbox-id>/
-    │                   own branch, survives everything
-    │
-    └─ rootless Docker container  (disposable, --rm)
-           └─ your agent: claude, bash, pytest, anything
-```
+**Your checkout is never touched.** The agent works in `~/agent-sandbox/worktrees/<id>/` on branch `agent-sandbox/<id>`. Merge what you like. Delete the rest.
 
-One sandbox id owns one workspace and may outlive many containers. Metadata and
-logs live outside the container in `~/agent-sandbox/runs/<sandbox-id>/`, so a
-destroyed container never takes your results with it.
+**The sandbox remembers.** Each one keeps its own Claude home, so `agent-sandbox .` followed by `claude --resume` picks up the conversation you left. It resumes the same sandbox every time until you ask for `--new`.
 
-The substrate is deliberately generic. It knows nothing about milestones,
-model routing, judges, or evals — those belong to whatever drives it.
+**Secrets arrive on their own.** A worktree starts with tracked files only. List your gitignored `.env` under `worktree_seed` in the config and every new sandbox gets a copy, permissions intact. Only gitignored paths are copied, so nothing can end up in a commit.
 
-## Everyday commands
+**Git works inside.** Commit, branch, rebase, stash, all on the sandbox branch. Push is denied for the Claude operator, and the parts of `.git` that could run code on your host the next time you type `git` are mounted read-only.
 
-| Command | What it does |
+**Skills ride along.** Host skill directories mount read-only at `/root/.claude/skills/`, so a factory like [SSSF](https://github.com/bishalu/super-simple-software-factory) runs inside without being copied into the repo.
+
+## What the agent can reach
+
+Mounted in: the worktree, read-write. Shared package caches, separate from your real ones. Your Claude login, read-only. The sandbox's own agent home. Configured skills, read-only. The repository's `.git`, with read-only overlays on hooks and config.
+
+Not mounted: your home directory, `/`, SSH keys, the Docker socket, and any credential you did not ask for. `--with-github-auth` injects your `gh` token for one run. Nothing else ever grants GitHub access.
+
+Every mount is declared, printed before the run, and recorded in `runs/<id>/run.json`.
+
+Hardening on every run: rootless Docker only, `no-new-privileges`, all capabilities dropped and six added back for `apt`, CPU, memory and PID limits enforced, container removed on exit.
+
+## What it does not stop
+
+- The agent holds your Claude OAuth token. It can spend your quota and read the workspace.
+- Network is open by default. `--network none` is the only restriction on offer.
+- The repository's git common directory is read-write, so an agent can delete refs or prune objects. The overlays stop code execution on your host. They do nothing about history loss. Run untrusted agents against a clone.
+- Inside the container the process is root. Under rootless Docker that maps to your own host user, so it cannot exceed your privileges.
+- A container is not a VM. A kernel exploit is still a kernel exploit.
+- `--direct` runs on your live checkout with no isolation at all, guarded by a lock and nothing else.
+- Leaving the operator shell ends every process in the container. Wait for a long run, or run it detached.
+
+## Commands
+
+| | |
 |---|---|
-| `agent-sandbox .` | worktree + hardened container + interactive shell |
-| `agent-sandbox . -- claude` | run Claude Code inside the sandbox |
-| `agent-sandbox . -- claude -p "Implement X"` | one-shot agent run |
-| `agent-sandbox . -- npm test` | run any command |
-| `agent-sandbox . --direct -- pytest` | operate on your live checkout (locked) |
-| `agent-sandbox list` | all sandboxes, status, age, workspace |
-| `agent-sandbox enter <id>` | fresh container over an existing workspace |
-| `agent-sandbox rm <id>` | delete a workspace (refuses to discard work) |
-| `agent-sandbox clean` | sweep sandboxes older than 14 days |
-| `agent-sandbox clean --docker` | also prune dangling images and build cache |
-| `agent-sandbox doctor` | verify the whole stack end to end, including git and Claude inside a probe sandbox |
-| `agent-sandbox doctor --with-quota` | the same, plus one authenticated `claude -p` (spends a little quota) |
-| `agent-sandbox build` | rebuild the base image |
-| `agent-sandbox config show\|set` | persistent defaults |
+| `agent-sandbox .` | resume this repo's sandbox, or create one |
+| `agent-sandbox . --new` | a fresh sandbox even if one exists |
+| `agent-sandbox . -- <cmd>` | run one command and exit |
+| `agent-sandbox list` | every sandbox: status, age, workspace |
+| `agent-sandbox enter <id>` | a specific sandbox by id |
+| `agent-sandbox rm <id>` | remove one; refuses to discard unmerged work |
+| `agent-sandbox clean` | sweep sandboxes older than 14 days; `--docker` prunes images too |
+| `agent-sandbox doctor` | 28 checks, including git and Claude inside a probe container |
+| `agent-sandbox config show` | current defaults |
 
-Useful flags: `--cpus`, `--memory`, `--pids-limit`, `--timeout`, `--network`,
-`--mode`, `--read-only-root`, `--strict-caps`, `--with-github-auth`,
-`--experimental-gvisor`, `--json`, `--keep`/`--rm`.
+Defaults: 8 CPUs, 16g, 2048 PIDs, 12h timeout, full network. Override per run with a flag, or persistently in `~/agent-sandbox/config.json`. On timeout the container gets SIGTERM and 30 seconds to close its traces, then SIGKILL. The workspace is kept.
 
-Workspaces are preserved by default. `--rm` disposes of one after a run, but
-only when the run actually succeeded: a failed or timed-out run always keeps its
-workspace, so a crashed agent never costs you the work it did first.
+## Setup
 
-Everything is also available as a library, so another program can drive the
-substrate without the CLI:
-
-```python
-from agent_sandbox import (SandboxSpec, LocalDockerBackend, ResourceConfig, RunRecord,
-                           agent_home, config, mounts, worktree)
-
-cfg  = config.load_config()
-ws   = worktree.create("/path/to/repo")
-rec  = RunRecord(ws.sandbox_id)
-home = agent_home.ensure(ws.sandbox_id, cfg)          # seeds once, then reuses
-plan = mounts.plan_for(ws, cfg, home)                  # agent home, skills, git
-spec = SandboxSpec(ws.sandbox_id, ws, ["pytest"],
-                   resources=ResourceConfig("4", "8g", 1024, "2h"), record=rec,
-                   mounts=plan.mounts, env=plan.env)
-result = LocalDockerBackend().run(spec)
-```
-
-## Defaults
-
-| Setting | Default | Override |
-|---|---|---|
-| CPUs | 8 | `--cpus`, `AGENT_SANDBOX_CPUS` |
-| Memory | 16g | `--memory`, `AGENT_SANDBOX_MEMORY` |
-| PIDs | 2048 | `--pids-limit`, `AGENT_SANDBOX_PIDS` |
-| Timeout | 12h | `--timeout`, `AGENT_SANDBOX_TIMEOUT` |
-| Network | full | `--network`, `AGENT_SANDBOX_NETWORK` |
-| Mode | safe | `--mode`, `AGENT_SANDBOX_MODE` |
-
-Precedence is flag, then environment variable, then `~/agent-sandbox/config.json`,
-then the built-in default. Timeout is a hard wall-clock ceiling: on expiry the
-container is stopped (SIGTERM, 30 seconds of grace so an agent can close its
-traces) and then killed, the run is marked `timed_out` rather than a generic
-failure, and the workspace and logs are preserved.
-
-`skill_mounts` is list-valued and has no `config set` path; edit
-`~/agent-sandbox/config.json` by hand. `agent_home_template` is a plain string:
-
-```json
-{
-  "mode": "safe",
-  "skill_mounts": ["~/.claude/skills/sssf"],
-  "agent_home_template": "/home/you/agent-sandbox/templates/agent-home"
-}
-```
-
-`worktree_seed` is also list-valued. A worktree starts with tracked files
-only, so a repo's gitignored `.env` never arrives on its own; list the
-repo-relative paths (files or directories) to copy from the source checkout
-into every new worktree. Only gitignored entries are copied, missing ones are
-skipped, and the copies are disclosed on stderr and recorded as `seeded` in
-`run.json`. `enter` never re-seeds.
-
-```json
-  "worktree_seed": [".env", "secrets"]
-```
-
-`agent_home_template` defaults to the shipped template and only needs setting
-if you keep your own (it must contain `claude/settings.json`). `config show`
-prints both.
-
-## What the container can and cannot reach
-
-Mounted in:
-
-- your sandbox workspace, at `/workspace`, read-write — the only host path the
-  agent can modify
-- shared package caches from `~/agent-sandbox/cache/{npm,pnpm,pip}` — separate
-  from your real host caches, so a sandbox can never corrupt them
-- credentials, narrowly, as described below
-- the sandbox's own agent home at `/root/.claude` and `/root/.pi/agent`,
-  read-write, from `~/agent-sandbox/runs/<id>/agent-home/`
-- configured skill directories, read-only, under `/root/.claude/skills/`
-- for a worktree sandbox, the host repository's `.git` directory with
-  read-only overlays, described below
-
-Every one of these is declared with `--mount`, so a missing host path is an
-error before the container starts, never a silently created empty directory.
-All of them are listed in `run.json` under `mounts`, and printed before each
-run.
-
-Not present: the Docker socket, your home directory, `/`, your SSH keys, and any
-host credential you did not explicitly ask for.
-
-Hardening applied to every run, in every mode:
-
-- rootless Docker only — a rootful daemon is refused outright, because a
-  container escape there would be host root
-- `no-new-privileges`
-- `--cap-drop ALL`, then six capabilities added back (see below)
-- resource limits always applied
-- ephemeral container, removed on exit
-
-### The persistent agent home
-
-A sandbox id outlives its containers, and since 1.1 so does the agent's own
-state. Each sandbox owns `~/agent-sandbox/runs/<id>/agent-home/`, created 0700
-and mounted read-write:
-
-- `claude/` at `/root/.claude`: `settings.json` from the shipped template,
-  a per-sandbox `.claude.json`, the operator's sessions and transcripts under
-  `projects/`, and `skills/` where skill mounts land.
-- `pi-agent/` at `/root/.pi/agent`: Pi's agent directory with pi-claude-bridge
-  installed, `claude-bridge.json` pointing at the image's `claude` on the Max
-  plan, and worker sessions.
-- `seed.json`: which image and tool versions the home was seeded from.
-
-The home is seeded once, on the sandbox's first run, and `enter` never
-re-seeds it. `claude --resume` after `agent-sandbox enter <id>` lists and
-continues the session you left. The home lives until `agent-sandbox rm <id>`. A sandbox created by 1.0 has no home; its first 1.1 `enter` seeds one, with no prior session state to recover. A home whose seeding did not finish (no seed record) is rebuilt on the next run rather than trusted.
-
-When the image is rebuilt, existing homes keep their older tools. `run`,
-`enter`, and `doctor` print a drift warning naming the sandbox; re-seed with
-`agent-sandbox rm <id>` and a fresh run, or keep using it knowingly.
-
-The seeded `settings.json` puts Claude Code in `bypassPermissions` inside the
-sandbox (the container is the permission boundary) and denies the commands the
-sandbox cannot undo: `git push`, `gh pr|issue|release|repo`,
-`git worktree prune|repair|remove`, `git update-ref`, `git reflog`, `git gc`,
-`git branch -D`. Deny rules apply even in bypass mode. They bind only the Claude
-operator; anything else running in the container is bound by the mounts alone.
-
-`IS_SANDBOX=1` is set in every container. It is the gate Claude Code reads
-before allowing bypass as root, and it is how a skill or script can tell it is
-running inside a sandbox rather than on your host.
-
-### Skill mounts
-
-`skill_mounts` in `config.json` lists host directories to expose read-only at
-`/root/.claude/skills/<basename>` in every sandbox. Symlinks are resolved on
-the host first (a `~/.claude/skills/x` entry is usually a link into a checkout
-elsewhere, and the container cannot follow a host symlink). A missing or
-non-directory entry fails the run by name before any worktree or branch is
-created. An empty list mounts nothing.
-
-### Git inside a worktree sandbox
-
-A linked worktree's `.git` is a file pointing at `<repo>/.git/worktrees/<id>`,
-so in 1.0 every git command inside a worktree sandbox failed. Since 1.1 a
-worktree sandbox additionally mounts, at their host paths:
-
-| Path | Mode |
-|---|---|
-| `<repo>/.git` (the common directory) | read-write |
-| the worktree itself, a second time | read-write |
-| `.git/worktrees/<id>` (this sandbox's admin dir) | read-write |
-| `.git/config`, `.git/config.worktree`, `.git/HEAD`, `.git/index` | read-only overlay |
-| `.git/hooks`, `.git/modules`, `.git/worktrees` | read-only overlay |
-| `.git/worktrees/<id>/config.worktree` | read-only overlay |
-
-The overlays cover every path a write could turn into code that runs on your
-host the next time you run git: hooks, `core.hooksPath`, `core.fsmonitor`,
-submodule git dirs, other worktrees' config. An overlay whose host source does
-not exist is served from an empty stand-in under `runs/<id>/git-overlays/`, so
-none is ever skipped. Your main checkout is not mounted.
-
-What works inside: `git status`, `add`, `commit`, `log`, `diff`, `branch`,
-`stash`, `rebase` on the sandbox branch, and `git worktree list|prune`, which
-sees this worktree at its real path and prunes nothing. What does not, by
-design: `git config` writes, `git remote add`, `git push -u` (it needs to write
-the upstream into `.git/config`), submodule operations, and `git worktree add`.
-`git branch --set-upstream-to` writes nothing and does not say so. Commit
-identity comes from the environment instead: `GIT_AUTHOR_*` and
-`GIT_COMMITTER_*` are resolved per run from the repository's own config, local
-identity first, then global. A worktree sandbox on a repository with no
-resolvable identity refuses to start. A repository that no longer resolves at all
-(moved or deleted since the sandbox was created) starts with a warning and
-no identity variables instead.
-
-Only a repository whose common directory is `<repo>/.git` qualifies. A
-submodule or a repository that is itself a linked worktree runs the 1.0 way,
-with no git mounts and a warning, and a Docker outage fails before any worktree
-or branch exists.
-
-**Accepted exposure.** The common directory is read-write, so a process in the
-container can still irreversibly destroy host repository state: delete or
-rewrite refs, expire reflogs, prune objects, and overwrite the index of every
-other worktree of that repository. The operator deny list covers the obvious
-verbs, but it binds only the Claude operator; workers and scripts are bound by
-the overlays alone. This is accepted, not closed. Run untrusted agents against
-a clone.
-
-`agent-sandbox rm` and `clean` touch the host repository only through
-`git worktree remove`, `git worktree prune`, and deleting the sandbox branch; a
-guard refuses to delete anything inside the repository's `.git`. `--rm` after a
-run keeps the workspace when its branch carries commits present on no other
-branch, and prints why.
-
-### Authentication exposed to containers
-
-**Claude, by default (layers 1 and 2 of the ladder):**
-
-- `~/.claude/.credentials.json`, read-only. This is your OAuth token. An agent
-  in the sandbox can make Claude API calls as you.
-- a per-sandbox `.claude.json` inside the agent home, read-write, seeded once
-  with onboarding flags and `/workspace` pre-trusted and then owned by Claude
-  Code for that sandbox. Without an agent home (library use that skips
-  `agent_home.ensure`) it is the 1.0 read-only generated file instead.
-
-Your real `~/.claude.json` is **not** mounted. That file is ~63 KB and carries
-project history, MCP server configuration, and account and machine identifiers.
-Verified: Claude Code authenticates inside the sandbox with the minimal mount
-alone, so the broader file is never needed. `--with-full-claude-state` exists to
-mount it read-only, but nothing escalates to it automatically.
-
-If `ANTHROPIC_API_KEY` is set and no credential file exists, the key is injected
-as an environment variable instead and nothing is mounted.
-
-The credentials mount is read-only, so a token refresh inside the container
-cannot be written back. `doctor` warns when the host access token expires
-within an hour; run `claude` on the host once before a long run. How Claude
-Code behaves inside a sandbox on a session longer than the token lifetime is
-unverified in 1.1. If it fails, the fallback is `claude setup-token` on the
-host and `CLAUDE_CODE_OAUTH_TOKEN` in the container's environment.
-
-**GitHub: nothing, unless you ask.** `--with-github-auth` injects `GH_TOKEN` and
-`GITHUB_TOKEN` from your host `gh` login for that one run, letting the agent push
-and open PRs as you. Without the flag no GitHub credential exists in the
-container. SSH keys are never mounted in any mode.
-
-Nothing is ever baked into the image, and nothing is copied into a repository.
-
-## Modes
-
-`fast` and `safe` are capability labels, stable in the CLI regardless of what
-backs them. **Today they are identical**: rootless Docker with runc and the full
-hardening baseline.
-
-That is an honest result, not an oversight. gVisor was measured on this machine
-and cannot enforce cgroup limits here — it only runs rootless with
-`-ignore-cgroups`, which forfeits `--memory`, `--cpus`, and `--pids-limit`.
-Since enforced limits are part of the baseline, gVisor is a trade rather than an
-upgrade, so it cannot back the default. If that changes upstream, `safe` can
-absorb it without any change to how you invoke the tool.
-
-`--experimental-gvisor` runs under gVisor anyway, for cases where syscall-level
-containment matters more than resource ceilings. It warns loudly and records
-`runtime: runsc` in the run metadata.
-
-## Security limitations
-
-Be clear-eyed about what this does and does not stop.
-
-- **A sandboxed agent can act as you against the Claude API.** The OAuth token
-  is mounted. It cannot read the rest of your home directory, but it can spend
-  your quota and see anything in the workspace.
-- **`--with-github-auth` grants real write access** to every repository your
-  `gh` token can reach, for the duration of that run.
-- **Network is unrestricted by default.** An agent can reach anything your
-  machine can. `--network none` is the only real restriction today;
-  `restricted` deliberately fails rather than pretending to filter.
-- **Six capabilities are retained.** CHOWN, DAC_OVERRIDE, FOWNER, FSETID,
-  SETGID, SETUID, because `apt-get` needs them and installing OS packages is
-  normal agent work. `--strict-caps` drops them, which breaks apt but leaves
-  npm, pip, and venv working.
-- **The process runs as UID 0 inside the container.** Under rootless Docker
-  that maps to your own host user, so it is not host root and cannot exceed your
-  privileges. It is chosen so files written into the worktree come back owned by
-  you rather than by an unusable subordinate uid. `docker ps` will still say
-  root; that is expected here and means something different than it does under a
-  rootful daemon.
-- **Container isolation is not a VM.** A kernel exploit is still a kernel
-  exploit. Rootless mode limits the blast radius to your user account, not the
-  host. A microVM backend is deliberately out of scope for now.
-- **`--direct` has no isolation at all.** It mutates your real checkout by
-  design, guarded only by an advisory lock against concurrent `--direct` runs.
-- **A worktree sandbox can destroy host repository history.** The git common
-  directory is read-write; the overlays stop code execution on the host, not
-  ref deletion, reflog expiry, object pruning, or index overwrites in other
-  worktrees. See the accepted exposure above.
-- **Claude Code runs with bypass inside the sandbox.** The seeded settings
-  skip permission prompts because the container is the boundary. The deny
-  list is a convenience for the operator, not a control on other processes.
-- **Do not exit the operator shell while a long agent run is in progress.**
-  Leaving the container ends every process in it. The timeout stops first and
-  kills 30 seconds later, but a manual exit gives a running chain no such
-  grace; wait for it, or run it detached inside the sandbox.
-
-## Setup on a fresh machine
-
-Rootless Docker, with no `docker` group and no rootful daemon:
+Rootless Docker, no `docker` group, rootful daemon off:
 
 ```bash
-sudo apt-get install -y ca-certificates curl iptables uidmap dbus-user-session \
-                        slirp4netns fuse-overlayfs
-# Docker's official repo, then:
+sudo apt-get install -y ca-certificates curl iptables uidmap dbus-user-session slirp4netns fuse-overlayfs
+# add Docker's apt repo, then:
 sudo apt-get install -y docker-ce docker-ce-cli docker-ce-rootless-extras containerd.io
-sudo systemctl disable --now docker.service docker.socket   # rootful daemon off
+sudo systemctl disable --now docker.service docker.socket
 dockerd-rootless-setuptool.sh install
 systemctl --user enable --now docker
-sudo loginctl enable-linger "$USER"        # daemon survives logout
+sudo loginctl enable-linger "$USER"
 ```
 
-Then `agent-sandbox doctor`. It checks all of the above and tells you what to
-run if something is missing.
+Then `agent-sandbox doctor`. It says what is missing and what to run.
 
-Two WSL2-specific traps worth knowing, both already handled by this tool but
-worth recognizing if you set this up elsewhere:
+Two WSL2 traps, both caught by `doctor`: the generated `docker.service` inherits a Windows `PATH` with spaces that systemd cannot parse, and `native.cgroupdriver=cgroupfs` makes Docker accept memory limits it then silently ignores. gVisor's installer writes the second one.
 
-1. The generated `docker.service` bakes in your inherited `PATH`, which on WSL2
-   contains Windows interop entries with spaces. systemd's `Environment=` parser
-   splits those into garbage and the daemon fails to start. Replace that line
-   with a clean PATH.
-2. Do **not** set `native.cgroupdriver=cgroupfs` in `~/.config/docker/daemon.json`.
-   Rootless Docker needs the default systemd driver; with cgroupfs the daemon
-   accepts `--memory` and `--pids-limit` and then silently fails to enforce them.
-   `gVisor`'s installer writes that setting, so re-check after installing runsc.
-   `agent-sandbox doctor` probes actual enforcement from inside a container
-   specifically to catch this.
+## The rest
 
-## Layout
+`SPEC.md` is the requirement list, R-01 to R-23. `REVIEW.md` records evidence for every one, plus the deviations and why. `PLAN.md` is the build order. The package is a library too: `SandboxBackend` has one implementation, and the seams for another are already separate.
 
-```
-~/agent-sandbox/
-  bin/agent-sandbox          entry point (symlinked into ~/.local/bin)
-  agent_sandbox/             the package
-    cli.py                   argparse wiring only, no policy
-    backend.py               SandboxBackend ABC, SandboxSpec, SandboxResult
-    docker_backend.py        LocalDockerBackend: hardening, limits, execution
-    worktree.py              worktree/copy lifecycle, --direct lock
-    mounts.py                typed bind mounts, skill mounts, git identity
-    agent_home.py            persistent per-sandbox agent home, seeding, drift
-    gitdir.py                git common-dir mount and read-only overlays
-    credentials.py           the four-layer credential ladder
-    resources.py             limits, parsing, defaults
-    metadata.py              per-run records
-    image.py                 fingerprint and auto-build
-    doctor.py                health checks
-    cleanup.py               rm / clean / targeted docker prune
-  image/Dockerfile           the base image
-  image/toolchain/           Claude Code and Pi, pinned by lockfile
-  image/pi-agent-template/   pi-claude-bridge template seeded into each home
-  templates/agent-home/      the seeded Claude settings.json
-  worktrees/<id>/            sandbox workspaces (your work lives here)
-  runs/<id>/run.json         metadata, stdout.log, stderr.log
-  runs/<id>/agent-home/      /root/.claude and /root/.pi/agent, until rm
-  cache/{npm,pnpm,pip}/      shared package caches
-  config.json                persistent defaults
-  SPEC.md PLAN.md REVIEW.md  the build contract, plan, and verification
-```
-
-## Extending it later
-
-The seams that matter are already separate: sandbox lifecycle, worktree
-lifecycle, execution, resource configuration, credentials, and metadata each
-live in their own module, and `SandboxBackend` is an abstract base with exactly
-one implementation.
-
-To add a backend, implement `preflight`, `run`, and `list_containers` against
-the same `SandboxSpec` and return a `SandboxResult`. Nothing in the CLI needs to
-change. `ExeBackend` and `MicroVMBackend` are deliberately not built.
-
-For an orchestrator on top: drive the library API rather than the CLI, use
-`--json` or `RunRecord.public()` for structured results, and treat the sandbox
-id as the durable handle — it outlives any single container. Declare extra
-exposure as `Mount` objects on `SandboxSpec.mounts`; call `agent_home.ensure`
-and then `mounts.plan_for(workspace, config, home)` so `run` and `enter` mount
-the same set; and read the record's `agent_home`, `mounts`, and
-`trusted_mounts` fields to see exactly what a sandbox could reach.
+`fast` and `safe` modes are identical today. gVisor cannot enforce cgroup limits on this machine, so it is opt-in through `--experimental-gvisor` rather than the default.
