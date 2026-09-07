@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Entry point shim. All logic lives in the agent_sandbox package."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from agent_sandbox.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
