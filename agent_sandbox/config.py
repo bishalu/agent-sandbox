@@ -48,6 +48,11 @@ DEFAULTS = {
     # /root/.claude/skills/<basename> (R-19). List-valued: edit config.json
     # by hand; `config set` handles scalars only.
     "skill_mounts": [],
+    # Gitignored paths copied from the source checkout into every new worktree
+    # (R-23). A worktree starts with tracked files only, so a repo's `.env`
+    # never arrives on its own. Repo-relative files or directories; only
+    # entries git ignores are copied. List-valued: edit config.json by hand.
+    "worktree_seed": [],
 }
 
 _ENV = {

@@ -305,6 +305,20 @@ logs are still preserved (R-03).
 - Probe output written to evidence passes through a redactor that masks the
   value of any key containing `TOKEN`, `KEY`, or `SECRET`.
 
+### R-23 Worktree seeding
+- `worktree_seed` in `config.json` is a list of repo-relative paths (files or
+  directories). On `run` against a git repository, each entry that exists in
+  the source checkout **and is gitignored there** is copied into the new
+  worktree right after `git worktree add`, permissions preserved. Missing
+  entries are skipped. `enter` never re-seeds; `--direct` and copy workspaces
+  are unaffected.
+- An entry that is present but not gitignored is not copied and produces a
+  warning: a tracked path is already in the worktree, and an untracked one
+  would be committed from inside the sandbox. An absolute entry, one
+  containing `..`, or a non-list value is a hard error naming the entry.
+- The copied paths are disclosed on stderr before the container starts and
+  recorded as `seeded` in `run.json`. An empty list copies nothing.
+
 ## Deferred (must NOT be built now)
 
 `--network restricted` implementation, paranoid/microVM backend, per-repo

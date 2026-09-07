@@ -105,6 +105,17 @@ failure, and the workspace and logs are preserved.
 }
 ```
 
+`worktree_seed` is also list-valued. A worktree starts with tracked files
+only, so a repo's gitignored `.env` never arrives on its own; list the
+repo-relative paths (files or directories) to copy from the source checkout
+into every new worktree. Only gitignored entries are copied, missing ones are
+skipped, and the copies are disclosed on stderr and recorded as `seeded` in
+`run.json`. `enter` never re-seeds.
+
+```json
+  "worktree_seed": [".env", "secrets"]
+```
+
 `agent_home_template` defaults to the shipped template and only needs setting
 if you keep your own (it must contain `claude/settings.json`). `config show`
 prints both.

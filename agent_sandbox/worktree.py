@@ -193,6 +193,63 @@ def create(target, sandbox_id=None, direct=False):
     return Workspace(sid, dest, "copy", repo=target)
 
 
+def seed(ws, paths):
+    """Copy gitignored paths from the source checkout into a fresh worktree (R-23).
+
+    `git worktree add` gives a worktree the tracked files only, so the secrets a
+    repo keeps in a gitignored `.env` never arrive on their own and an agent
+    runs against a silently degraded setup. `worktree_seed` in config.json
+    lists repo-relative paths (files or directories) to copy in after creation.
+
+    Only paths git ignores in the source repo are copied: a tracked path is
+    already in the worktree, and an untracked-but-not-ignored one would be a
+    commit waiting to happen inside the sandbox. Entries missing from the
+    source are skipped (a repo without a `.env` has nothing to seed). Copies
+    preserve permissions, so a 0600 `.env` stays 0600.
+
+    Returns (copied, warnings): the relative paths copied, and one warning per
+    entry that was present but not gitignored.
+    """
+    if not paths:
+        return [], []
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        raise WorktreeError(
+            "worktree_seed in config.json must be a list of repo-relative paths, "
+            f"got {type(paths).__name__}",
+            'Example: "worktree_seed": [".env", "secrets"]',
+        )
+    if ws.kind != "worktree" or not ws.repo:
+        return [], []
+    root = pathlib.Path(ws.repo)
+    copied, warnings = [], []
+    for raw in paths:
+        rel = raw.strip().strip("/")
+        parts = pathlib.PurePosixPath(rel).parts
+        if not rel or pathlib.PurePosixPath(raw.strip()).is_absolute() or ".." in parts:
+            raise WorktreeError(
+                f"worktree_seed entry must be a relative path inside the repo: {raw!r}",
+                'Example: "worktree_seed": [".env", "secrets"]',
+            )
+        src = root / rel
+        if not src.exists():
+            continue
+        p = _run(["git", "-C", str(root), "check-ignore", "-q", "--", rel], check=False)
+        if p.returncode != 0:
+            warnings.append(
+                f"worktree_seed: {rel} is not gitignored in {root}; not copied "
+                "(a tracked path is already in the worktree, and an untracked one "
+                "would be committed from inside the sandbox)")
+            continue
+        dest = ws.path / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dest, symlinks=False, dirs_exist_ok=True)
+        else:
+            shutil.copy2(src, dest)
+        copied.append(rel)
+    return copied, warnings
+
+
 def reopen(sandbox_id):
     """Workspace for an existing sandbox id (used by `enter`)."""
     from .metadata import RunRecord

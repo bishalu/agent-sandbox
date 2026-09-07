@@ -213,6 +213,15 @@ Acceptance (each observed and recorded in REVIEW.md, v1.1 section):
 - A change to any file under `image/` flips `needs_build`; `node_modules` is
   ignored.
 
+## M9 — v1.2: worktree seeding (R-23)
+
+One commit. `worktree.seed()` copies the gitignored paths named by
+`worktree_seed` from the source checkout into a fresh worktree; `cmd_run`
+calls it right after the record is first saved, discloses the copies, and
+records them under `seeded`. Motivation: the vibeset-dj factory ran a full
+chain against a worktree with no `.env`, silently measuring a degraded
+source set, because gitignored files never cross `git worktree add`.
+
 ## Risks
 
 | Risk | Mitigation |

@@ -96,6 +96,12 @@ def cmd_run(args, command):
                branch=ws.branch).save()
 
     try:
+        # Gitignored secrets the repo keeps beside its code (R-23). Done first:
+        # a seed failure must leave a sandbox that `list` and `rm` can see.
+        seeded, seed_warnings = worktree.seed(
+            ws, config.resolve("worktree_seed", None, cfg))
+        rec.update(seeded=seeded).save()
+
         img = config.resolve("image", args.image, cfg)
         image.ensure(img, quiet=bool(args.json))
 
@@ -131,6 +137,11 @@ def cmd_run(args, command):
                         "--cpus/--memory/--pids-limit are NOT enforced for this run.")
             for line in creds.describe():
                 _eprint(f"[{PROG}] credentials: {line}")
+            if seeded:
+                _eprint(f"[{PROG}] seeded: {', '.join(seeded)} "
+                        f"(gitignored copies from {ws.repo})")
+            for w in seed_warnings:
+                _eprint(f"{PROG}: warning: {w}")
             _describe_plan(plan)
 
         spec = SandboxSpec(
