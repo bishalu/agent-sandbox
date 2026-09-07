@@ -18,7 +18,7 @@ class SandboxSpec:
                  mode="safe", network="full", image=None, credentials=None,
                  read_only_root=False, experimental_gvisor=False,
                  interactive=None, env=None, record=None,
-                 stream_output=True):
+                 stream_output=True, mounts=None):
         self.sandbox_id = sandbox_id
         self.workspace = workspace          # Workspace object
         self.command = command or []        # [] means interactive shell
@@ -32,6 +32,10 @@ class SandboxSpec:
         self.interactive = (not command) if interactive is None else interactive
         self.env = env or {}
         self.record = record                # RunRecord, for logs/metadata
+        # Non-credential bind mounts (agent home, skills, git common dir): a
+        # list of mounts.Mount, rendered with --mount so a missing host path
+        # fails loudly (R-16).
+        self.mounts = list(mounts or [])
         # False in --json mode: container output goes to the run logs only, so
         # it cannot interleave with the structured result on stdout.
         self.stream_output = stream_output

@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-from . import config
+from . import config, mounts
 from .backend import SandboxBackend, SandboxResult
 from .errors import DockerUnavailable, NotImplementedYet, RootfulDockerRefused
 
@@ -125,6 +125,13 @@ class LocalDockerBackend(SandboxBackend):
         args += ["-v", f"{config.CACHE / 'pnpm'}:/root/.local/share/pnpm/store"]
         args += ["-v", f"{config.CACHE / 'pip'}:/root/.cache/pip"]
 
+        # --- declared mounts: agent home, skills, git common dir (R-16..R-18) ---
+        # Rendered with --mount so a missing host source is an error, never a
+        # silently created empty directory. Docker orders mounts by
+        # destination, so a nested read-only file (credentials) still layers
+        # correctly on top of a read-write parent declared here.
+        args += mounts.render(spec.mounts)
+
         # --- read-only root, an independent option (R-05) ---
         if spec.read_only_root:
             args += ["--read-only"]
@@ -141,6 +148,13 @@ class LocalDockerBackend(SandboxBackend):
         args += ["-e", "AGENT_SANDBOX=1"]
         args += ["-e", f"AGENT_SANDBOX_ID={spec.sandbox_id}"]
         args += ["-e", "HOME=/root"]
+        # IS_SANDBOX=1 is the gate Claude Code reads before refusing
+        # bypassPermissions as root; the container IS the sandbox (R-17).
+        # CLAUDE_CONFIG_DIR keeps .claude.json inside the (persistent) home.
+        # Both are also baked into the image; repeating them here means a
+        # custom --image cannot silently drop them.
+        args += ["-e", "IS_SANDBOX=1"]
+        args += ["-e", f"CLAUDE_CONFIG_DIR={mounts.CONTAINER_HOME}/.claude"]
         for k, v in (spec.env or {}).items():
             args += ["-e", f"{k}={v}"]
 

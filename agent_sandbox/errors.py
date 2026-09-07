@@ -51,3 +51,9 @@ class SandboxNotFound(SandboxError):
 
 class CredentialError(SandboxError):
     pass
+
+
+class MountError(SandboxError):
+    """A declared bind mount cannot be honored: missing source, bad config,
+    or an unresolvable git identity. One class for every mount failure; the
+    message and remedy carry the specifics."""
