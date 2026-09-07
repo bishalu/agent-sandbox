@@ -175,10 +175,13 @@ def ensure(sandbox_id, cfg=None, img=None, quiet=False):
         # A previous seeding did not finish; nothing in it was ever used by a
         # container (the container only starts after ensure() returns), so
         # start over rather than serve a home with no bridge and no record.
+        # Set aside rather than delete: if the seed record ever goes missing
+        # from a used home, nothing is lost, and `rm` still sweeps runs/<id>.
+        aside = home.path.with_name(f"{DIRNAME}.broken-{_now().replace(':', '')}")
+        home.path.rename(aside)
         if not quiet:
-            print(f"[agent-sandbox] re-seeding incomplete agent home {home.path}",
-                  flush=True)
-        shutil.rmtree(home.path, ignore_errors=True)
+            print(f"[agent-sandbox] re-seeding incomplete agent home "
+                  f"(previous tree kept at {aside})", flush=True)
 
     template = _template_dir(cfg)
     _mkdir_private(home.path)
