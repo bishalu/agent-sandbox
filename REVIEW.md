@@ -141,3 +141,79 @@ The lesson worth keeping: a review written from the builder's own notes will
 confirm the builder's own beliefs. Pass 2 only found the `--keep`/`--rm` miss by
 mechanically diffing the spec's flag list against `add_argument` calls, not by
 re-reading prose.
+
+---
+
+# Review of v1.1 against SPEC.md R-16..R-22
+
+Reviewed 2026-09-07 against SPEC.md R-16 to R-22 (and the R-07 and R-11
+changes) and PLAN.md M8. Every row cites evidence observed on this machine.
+Doctor and container output quoted here passed through the R-22 redactor.
+
+## Verdicts
+
+| Req | Verdict | Evidence |
+|---|---|---|
+| R-07 layer 2 (1.1) | PASS | Inside a sandbox `/root/.claude` was mode 700, `.credentials.json` and `.claude.json` 600. `claude -p --session-id <uuid>` under bypass returned `HOME_OK`. Host `~/.claude.json` still not mounted. See D-4 for the wording change. |
+| R-11 image (1.1) | PASS | Image build 91 s full, 6 s cached; the Dockerfile's own version assertions passed. Fingerprint changed when a file under `image/` changed and ignored `node_modules`. `doctor`: "pi-claude-bridge models: image template: 8, seeded home: 8". |
+| R-16 typed mounts | PASS | A missing `skill_mounts` entry failed before any worktree was created (worktrees before=2 after=2), naming the entry. A linked-worktree target ran with `trusted_mounts []` in `run.json` and a warning. Mounts are printed before each run and listed in `run.json` under `mounts`. |
+| R-17 environment | PASS | `env` inside the container, filtered to the named keys, showed `IS_SANDBOX=1`, `CLAUDE_CONFIG_DIR=/root/.claude`, `GIT_AUTHOR_EMAIL=local@example.test` (the throwaway repo's local identity, not the global one). `doctor`: "git identity: resolves (doctor@agent-sandbox.local for a repo with a local identity)". `doctor`: "root bypass gate (IS_SANDBOX): Claude Code accepts bypass as root inside the sandbox (no quota spent)". |
+| R-18 agent home | PASS | `/root/.claude` 700; `.credentials.json` and `.claude.json` 600. Seeded Pi home listed 8 `claude-bridge` models. `claude -p --session-id <uuid>` returned `HOME_OK`; after `agent-sandbox enter`, `claude -p --resume <uuid>` returned the remembered word `PELICAN` with the same session id, and `settings.json` mtime was unchanged (no re-seed). `doctor`: "agent home persists across runs: file written in run 1 present in run 2", "agent home template" PASS. |
+| R-19 skill mounts | PASS | A symlinked skill dir appeared read-only at `/root/.claude/skills/grill-me` and `touch` there failed. A missing entry failed before any worktree was created (worktrees before=2 after=2). `doctor`: "skill mounts" PASS. |
+| R-20 git in worktree sandboxes | PASS (after fix) | `git commit` inside succeeded (`11659fd`) and `git log agent-sandbox/<id>` on the host showed it. `git worktree prune` inside left 2 entries. Six overlay writes failed: `touch: cannot touch '.../.git/hooks/pre-commit': Read-only file system`; `error: could not write config file .../.git/config: Device or resource busy`; HEAD write `Read-only file system`; `mkdir: cannot create directory '.../.git/modules/x': Read-only file system`; `worktrees/marker` `Read-only file system`; `config.worktree` `Read-only file system`. With `DOCKER_HOST=unix:///nonexistent.sock` the run failed at preflight with branches before=1 after=1. A linked-worktree target ran with `trusted_mounts []` and a warning. `--rm` on a run that committed printed "--rm ignored: <id> has 1 commit(s) not present on any other branch — refusing to delete" and kept the workspace; `--rm` with no new commits printed "workspace removed (--rm)". The guard had never fired in 1.0; see Gap 8. `doctor`: "worktree sandbox commit: commit inside the sandbox is visible on the host branch", "git overlays read-only: hooks/ refused a write", "worktree prune is a no-op". |
+| R-21 timeout | PASS | A 15 s timeout on a container trapping SIGTERM printed `TRAPPED-SIGTERM` and ended with status `timed_out`, exit 0: the stop reached the handler before the kill. |
+| R-22 doctor | PASS | `agent-sandbox doctor` on 2026-09-07: 28 passed, 0 warnings, 0 failed, 13.9 s. New checks all PASS: "git identity: resolves (doctor@agent-sandbox.local for a repo with a local identity)", "skill mounts", "agent home template", "Claude access token expiry: 333 min left", "worktree sandbox commit: commit inside the sandbox is visible on the host branch", "git overlays read-only: hooks/ refused a write", "worktree prune is a no-op", "pi-claude-bridge models: image template: 8, seeded home: 8", "root bypass gate (IS_SANDBOX): Claude Code accepts bypass as root inside the sandbox (no quota spent)", "agent home persists across runs: file written in run 1 present in run 2". Probe output is redacted for `TOKEN`, `KEY`, `SECRET` values before it is written. |
+
+## Gaps found and fixed during review
+
+**Gap 8: the 1.0 `unpushed_commits` guard never fired.**
+Its `git log --not --exclude=refs/heads/agent-sandbox/* --branches` pattern
+carried the `refs/heads/` prefix, but `--exclude` patterns for `--branches` are
+matched against the short name, so the sandbox branch was never excluded and
+the count was always 0. `rm` and `--rm` would have deleted unpushed work
+silently. Fixed in `worktree.py` (`--exclude=agent-sandbox/*`); verified by the
+`--rm ignored: ... 1 commit(s) not present on any other branch` observation
+above.
+
+**Gap 9: a bad `skill_mounts` entry surfaced after the worktree existed.**
+The first version validated skill mounts inside `plan_for`, which ran after
+`worktree.create`, so a typo in `config.json` left an orphan worktree and
+branch behind. `cmd_run` now calls `mounts.skill_mounts(cfg)` right after
+`preflight()`, before anything is created (worktrees before=2 after=2).
+
+**Gap 10: an empty `models.json` triggered a Pi schema warning.**
+The template seeded `models.json` as `{}`; Pi warned about the missing
+`providers` key on every start. The seed is now `{"providers": {}}` in
+`image/pi-agent-template/` and in `agent_home.ensure`.
+
+## Deliberate deviations from the spec, with justification
+
+**D-4: the per-sandbox `.claude.json` is writable.**
+1.0 mounted a read-only generated config as R-07 layer 2. With an agent home
+that file lives inside `runs/<id>/agent-home/claude/` read-write, because
+trust and bypass acknowledgements and the project list must persist per
+sandbox for `claude --resume` to work. It still contains only the generated
+keys (the same allow-list as before, plus `/workspace` pre-trusted) and
+whatever Claude Code writes for that sandbox; the host `~/.claude.json` is
+never exposed. R-07's layer-2 wording was rewritten to say so.
+
+**D-5: the read-only `.git/config` overlay breaks some git verbs on purpose.**
+`git config` writes, `git remote add`, and `git push -u` fail inside the
+sandbox (`Device or resource busy`), and `git branch --set-upstream-to` writes
+nothing silently. The overlay exists because `core.hooksPath` and
+`core.fsmonitor` in that file are host code execution; commit identity is
+supplied through the environment instead (R-17). None of the failing verbs is
+needed by the workloads the sandbox targets, and pushing is denied anyway.
+
+**D-6: `.git/modules` is overlaid read-only wholesale.**
+Rather than enumerating each submodule's `hooks/` directory, the whole
+`modules` tree is read-only, so submodule operations fail inside the sandbox
+instead of exposing submodule hooks. Refusing the git mount outright for
+repositories with submodules is deferred.
+
+## Result
+
+All seven new requirements pass, plus the 1.1 changes to R-07 and R-11.
+Three gaps were found and fixed, one of them (Gap 8) a latent 1.0 defect that
+the new `--rm` path exposed. Three further deviations are documented with
+their justification. No requirement is silently unmet.

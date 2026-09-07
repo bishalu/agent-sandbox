@@ -1,8 +1,12 @@
 # agent-sandbox — Build Specification
 
+Version 1.1.0.
+
 Frozen specification, settled by design interview on 2026-09-06. This is the
 contract the implementation is reviewed against. Numbered requirements (R-nn)
-are testable; the review pass must cite evidence for each.
+are testable; the review pass must cite evidence for each. R-01 to R-15 are
+the 1.0.0 contract; R-16 to R-22 were added for 1.1.0 on 2026-09-07 from the
+SSSF v1 plan (`~/sssf/PLAN.md`, requirements R1 to R11 and KTD1 to KTD14).
 
 ## Purpose
 
@@ -26,6 +30,7 @@ project-specific config, factory logic. Those are SSSF. This is the substrate.
 | gVisor | runsc release-20260831.0 installed |
 | Claude auth | `~/.claude/.credentials.json` (0600, OAuth); no ANTHROPIC_API_KEY set |
 | gh | authenticated, scopes gist/read:org/repo/workflow |
+| Image toolchain (1.1) | Claude Code 2.1.263, Pi 0.85.1, pi-claude-bridge 0.7.0, uv 0.12.10, just 1.21.0, sqlite3 3.45.1 |
 
 ### Verified runtime findings
 
@@ -97,7 +102,11 @@ map to `full`.
 ### R-07 Credentials
 Layered, each tried only if the previous is insufficient:
 1. mount `~/.claude/.credentials.json` read-only, alone
-2. narrowly constructed sandbox-specific Claude config, only required fields
+2. narrowly constructed sandbox-specific Claude config, only required fields.
+   With an agent home (R-18) this is the per-sandbox writable `.claude.json`
+   inside `runs/<id>/agent-home/claude/`, seeded once from the same
+   allow-list and then owned by Claude Code for that sandbox; without an
+   agent home it is the 1.0 read-only generated file mount.
 3. `ANTHROPIC_API_KEY` env injection, no file mount
 4. `--with-full-claude-state` explicit opt-in to mount `~/.claude.json` ro
 Never automatic escalation to layer 4. GitHub: none by default;
@@ -112,7 +121,7 @@ agent-sandbox list
 agent-sandbox enter <sandbox-id>
 agent-sandbox rm <sandbox-id> [--force]
 agent-sandbox clean [--older-than N] [--force] [--docker]
-agent-sandbox doctor
+agent-sandbox doctor [--quick] [--with-quota]
 agent-sandbox build [--no-cache]
 ```
 Flags: `--mode`, `--cpus`, `--memory`, `--pids-limit`, `--timeout`,
@@ -139,6 +148,18 @@ archive utils, gh, Claude Code via its supported install method. Understandable
 Dockerfile, layer-cache friendly. Auto-built transparently on first use;
 rebuild triggered by Dockerfile fingerprint change. `build` forces a rebuild.
 
+1.1 addendum: the image also carries `uv` and `uvx` copied from the official
+image pinned by digest, `just`, `sqlite3`, and a Node toolchain (Claude Code
+2.1.263, Pi 0.85.1) installed with `npm ci` from a committed lockfile under
+`image/toolchain/`, so the pin is the lockfile rather than a version string.
+`DISABLE_AUTOUPDATER=1`, `IS_SANDBOX=1`, and `CLAUDE_CONFIG_DIR=/root/.claude`
+are image environment. A Pi agent template with pi-claude-bridge 0.7.0
+(`image/pi-agent-template/`, its own lockfile) is built at
+`/opt/agent-sandbox/pi-agent-template`, outside `/root` because the runtime
+home mount shadows `/root`. The build fails unless the pinned versions report
+back and the template lists `claude-bridge` models. The fingerprint hashes
+every file under `image/` except `node_modules`, sorted by path.
+
 ### R-12 Structure for future SSSF integration
 Separate modules: sandbox lifecycle, worktree lifecycle, execution, resource
 config, credentials, metadata/logs. `SandboxBackend` ABC with
@@ -162,6 +183,127 @@ shell sandbox against a throwaway repo, file isolation verified, worktree
 behavior verified, resource limits verified, container cleanup verified, work
 survives container destruction, Claude Code tested inside the sandbox if auth
 permits, usage documented. Existing repos not modified during testing.
+
+### R-16 Typed mounts
+- Every bind mount beyond the workspace, the package caches, and the
+  credential files is a `Mount` (host path, container path, read-only flag,
+  one-word purpose) carried on `SandboxSpec.mounts` and rendered as
+  `--mount type=bind,...`, never `-v`.
+- A configured mount whose host source does not exist is a hard error
+  (`MountError`) naming the path and purpose, raised before the container
+  starts. Nothing is ever created implicitly to satisfy a mount.
+- One planner, `mounts.plan_for(workspace, config, agent_home)`, composes the
+  agent-home, skill, and git mounts for both `run` and `enter`; `enter`
+  re-derives the git set from the host rather than replaying the record.
+- `run.json` records every declared mount under `mounts` (host, container,
+  mode, purpose) and the git set additionally under `trusted_mounts`. The
+  credential ladder (R-07) keeps its own module and disclosure record.
+
+### R-17 Container environment
+- Every container has `IS_SANDBOX=1` and `CLAUDE_CONFIG_DIR=/root/.claude`,
+  set both as image environment and again at run time so a custom `--image`
+  cannot drop them. `IS_SANDBOX=1` is the gate Claude Code reads before
+  refusing `bypassPermissions` as root.
+- A git identity is resolved per run from the source repository with
+  `git -C <repo> config --get user.name` and `user.email` (local, then
+  global) and injected as `GIT_AUTHOR_*` and `GIT_COMMITTER_*`. A worktree or
+  direct workspace with no resolvable identity is a hard error before the
+  container starts; a copy workspace gets no identity variables.
+- No `~/.gitconfig` is mounted.
+
+### R-18 Persistent agent home
+- Each sandbox owns `runs/<id>/agent-home/{claude,pi-agent}`, bind-mounted
+  read-write at `/root/.claude` and `/root/.pi/agent`, created 0700, seeded
+  exactly once on the first run, never re-seeded by `enter`, and retained
+  until `agent-sandbox rm <id>`.
+- `seed.json` records the image fingerprint, the pinned tool versions, the
+  template path, and the seed time. When the fingerprint no longer matches
+  the current image, `run`, `enter`, and `doctor` print a drift warning that
+  names the re-seed procedure (`rm`, then recreate) and still start.
+- The Claude home is copied from the template named by the config key
+  `agent_home_template` (default `templates/agent-home`). The shipped
+  `settings.json` sets `permissions.defaultMode: bypassPermissions`,
+  `skipDangerousModePermissionPrompt: true`, and a deny list covering
+  `git push`, `gh pr|issue|release|repo`, `git worktree prune|repair|remove`,
+  `git update-ref`, `git reflog`, `git gc`, and `git branch -D`; it sets no
+  `model`.
+- The seed also writes a per-sandbox writable `.claude.json` (0600) built from
+  the R-07 layer-2 allow-list plus `/workspace` pre-trusted, an empty 0600
+  `.credentials.json` so the read-only credentials mount never lands on a
+  world-readable mountpoint, and empty `skills/` and `projects/` directories.
+  The host `~/.claude.json` is never exposed.
+- The Pi home is the image template copied out through a throwaway container:
+  the bridge package, its `settings.json` package entry, `claude-bridge.json`
+  pointing at the image's `claude` with `plan: max`, and `models.json` as
+  `{"providers": {}}`.
+- `agent-sandbox enter <id>` followed by `claude --resume` continues a session
+  created in an earlier container of the same sandbox.
+
+### R-19 Skill mounts
+- `skill_mounts` in `config.json` is a list of host paths. Each is expanded
+  and symlink-resolved on the host, must be a directory, and is mounted
+  read-only at `/root/.claude/skills/<basename>` inside the agent home, on
+  both `run` and `enter`.
+- A missing or non-directory entry, a non-list value, or two entries sharing
+  a basename is a hard error naming the entry, raised before any worktree or
+  branch is created. An empty list mounts nothing.
+
+### R-20 Git inside worktree sandboxes
+- For a worktree workspace whose git common directory resolves to
+  `<repo>/.git` (checked with `git rev-parse --git-common-dir` before the
+  worktree is created), the container gets: the common directory read-write
+  at its host path; the worktree a second time at its host path; read-only
+  overlays for `.git/config`, `.git/HEAD`, `.git/index`, `.git/hooks`,
+  `.git/modules`, and `.git/worktrees`; the sandbox's own
+  `.git/worktrees/<id>` read-write on top of the `worktrees` overlay; and its
+  `config.worktree` read-only on top of that. The parent checkout is never
+  mounted.
+- An overlay whose host source is absent is served from an empty file or
+  directory created under `runs/<id>/git-overlays/`, so no overlay is ever
+  skipped.
+- A repository whose common directory is not `<repo>/.git` (a submodule or a
+  linked worktree) runs with no git mounts and a named warning, the 1.0
+  behaviour. `preflight()` and this check both run before `worktree.create`,
+  so a Docker outage or an unsupported repository shape leaves no orphan
+  worktree or branch.
+- `rm` and `clean` never remove a path inside the host repository's git
+  directory; a guard refuses and reports it as a bug. The host repository is
+  touched only by `git worktree remove`, `git worktree prune`, and deleting
+  the sandbox branch.
+- `--rm` honours the unpushed-commit guard regardless of exit status: a
+  workspace whose branch carries commits present on no other branch is kept
+  and the guard's reason is printed under the existing "ignored" notice.
+- What stays writable is the accepted residual exposure: refs, reflogs,
+  objects, and the index files of other worktrees of that repository. The
+  R-18 deny list binds only the Claude operator; other processes in the
+  container are bound by the overlays alone.
+
+### R-21 Timeout stops before it kills
+On expiry the backend runs `docker stop -t 30` (SIGTERM, 30 s grace) and
+then `docker kill` for whatever is still up, so an agent's own signal
+handlers can close their traces. Status is still `timed_out`; workspace and
+logs are still preserved (R-03).
+
+### R-22 doctor for 1.1
+- Host checks: a git identity resolves for a throwaway repository with a
+  local identity; the global identity is set (warn otherwise); every
+  configured `skill_mounts` entry validates; the agent home template
+  validates; the host access token's remaining lifetime, read from the expiry
+  field only, warns under one hour.
+- Sandbox probe, one throwaway repository, two containers: a commit inside a
+  worktree sandbox appears on the host branch; a write to `.git/hooks` is
+  refused; `git worktree prune` inside the container is a no-op; `pi
+  --list-models` lists `claude-bridge` models from both the image template and
+  the seeded home; `claude -p` with bypass and no credentials reports the
+  not-logged-in outcome rather than the root refusal, spending no quota; a
+  file written in the first container is present in the second. The
+  throwaway repository, worktree, and run record are removed in `finally`.
+- Every existing sandbox whose `seed.json` fingerprint differs from the
+  current image is named in one drift warning.
+- `--with-quota` opts in to one authenticated `claude -p` inside the probe;
+  nothing else spends quota.
+- Probe output written to evidence passes through a redactor that masks the
+  value of any key containing `TOKEN`, `KEY`, or `SECRET`.
 
 ## Deferred (must NOT be built now)
 
