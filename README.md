@@ -213,7 +213,9 @@ the upstream into `.git/config`), submodule operations, and `git worktree add`.
 identity comes from the environment instead: `GIT_AUTHOR_*` and
 `GIT_COMMITTER_*` are resolved per run from the repository's own config, local
 identity first, then global. A worktree sandbox on a repository with no
-resolvable identity refuses to start.
+resolvable identity refuses to start. A repository that no longer resolves at all
+(moved or deleted since the sandbox was created) starts with a warning and
+no identity variables instead.
 
 Only a repository whose common directory is `<repo>/.git` qualifies. A
 submodule or a repository that is itself a linked worktree runs the 1.0 way,
