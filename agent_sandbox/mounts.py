@@ -89,7 +89,17 @@ def plan_for(workspace, cfg, home=None):
         drift = home.drift()
         if drift:
             plan.warnings.append(drift)
-        plan.mounts += skill_mounts(cfg)
+        skills = skill_mounts(cfg)
+        plan.mounts += skills
+        # A mounted skill that carries a factory engine has to be findable from
+        # inside. The host justfile defaults SSSF_HOME to the skill under $HOME,
+        # which is the wrong path in here — HOME is /root and the skill is a
+        # read-only mount. Point at the mount so one justfile works both places.
+        for m in skills:
+            if pathlib.Path(m.container).name == "sssf":
+                engine = f"{m.container}/templates/adws"
+                if (pathlib.Path(m.host) / "templates" / "adws").is_dir():
+                    plan.env["SSSF_HOME"] = engine
     if workspace.kind == "worktree":
         common, warning = gitdir.check(workspace.repo)
         if warning:
