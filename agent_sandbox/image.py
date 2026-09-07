@@ -1,8 +1,9 @@
 """Base image build and fingerprinting (spec R-11).
 
-The Dockerfile is hashed; a changed hash or a missing image triggers a
-rebuild. This avoids the stale-image trap where an edited Dockerfile keeps
-serving the previously built image.
+Every file under image/ (Dockerfile, lockfiles, template files) is hashed; a
+changed hash or a missing image triggers a rebuild. This avoids the stale-image
+trap where an edited Dockerfile or lockfile keeps serving the previously built
+image.
 """
 
 import hashlib
@@ -20,7 +21,17 @@ def fingerprint():
             f"Dockerfile missing at {config.DOCKERFILE}",
             "Reinstall agent-sandbox or restore the image/Dockerfile file.",
         )
-    return hashlib.sha256(config.DOCKERFILE.read_bytes()).hexdigest()
+    h = hashlib.sha256()
+    files = sorted(
+        p for p in config.IMAGE_DIR.rglob("*")
+        if p.is_file() and "node_modules" not in p.relative_to(config.IMAGE_DIR).parts
+    )
+    for p in files:
+        rel = p.relative_to(config.IMAGE_DIR).as_posix()
+        h.update(rel.encode("utf-8") + b"\0")
+        h.update(p.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
 
 
 def _state():
@@ -51,7 +62,7 @@ def needs_build(image=None):
     if not exists(image):
         return True, "image not present"
     if _state().get(image) != fingerprint():
-        return True, "Dockerfile changed since last build"
+        return True, "image/ changed since last build"
     return False, "up to date"
 
 

@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep fd-find \
         unzip zip tar gzip bzip2 xz-utils \
         less nano vim-tiny procps psmisc file openssh-client \
-        sudo tini \
+        sudo tini just sqlite3 \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
@@ -51,8 +51,35 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Claude Code, via the supported npm distribution.
-RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
+# uv and uvx, copied from the official image pinned by digest.
+COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 \
+    /uv /uvx /usr/local/bin/
+
+# Node toolchain: Claude Code and Pi, installed from the committed lockfile so
+# the pin is the lockfile rather than a version string. Auto-update is off;
+# IS_SANDBOX lets Claude Code run with bypass as container root, and
+# CLAUDE_CONFIG_DIR keeps its state inside the mounted agent home.
+COPY toolchain/package.json toolchain/package-lock.json /opt/agent-sandbox/toolchain/
+RUN cd /opt/agent-sandbox/toolchain && npm ci --omit=dev && npm cache clean --force
+ENV PATH=/opt/agent-sandbox/toolchain/node_modules/.bin:$PATH \
+    DISABLE_AUTOUPDATER=1 \
+    IS_SANDBOX=1 \
+    CLAUDE_CONFIG_DIR=/root/.claude
+
+# Pi agent template: the bridge package tree plus settings, seeded into each
+# sandbox's agent home at run time. Built outside /root because /root is
+# shadowed by the runtime home mount.
+COPY pi-agent-template/ /opt/agent-sandbox/pi-agent-template/
+RUN cd /opt/agent-sandbox/pi-agent-template/npm && npm ci --omit=dev && npm cache clean --force
+
+# Fail the build if the pinned tools or the bridge template are not usable.
+# The template is checked through a scratch copy so pi's first-run files
+# (auth.json, models-store.json) do not end up in the template itself.
+RUN test "$(claude --version | grep -o '[0-9][0-9.]*' | head -1)" = "2.1.263" \
+    && test "$(pi --version | grep -o '[0-9][0-9.]*' | head -1)" = "0.85.1" \
+    && cp -r /opt/agent-sandbox/pi-agent-template /tmp/pi-agent-check \
+    && PI_CODING_AGENT_DIR=/tmp/pi-agent-check pi --list-models | grep -q claude-bridge \
+    && rm -rf /tmp/pi-agent-check
 
 # Unprivileged user available on request. uid 1000 matches the common host uid.
 RUN useradd -m -u 1000 -s /bin/bash agent || true
