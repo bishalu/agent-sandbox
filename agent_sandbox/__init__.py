@@ -19,10 +19,13 @@ from .backend import SandboxBackend, SandboxResult, SandboxSpec
 from .docker_backend import LocalDockerBackend
 from .metadata import RunRecord
 from .resources import ResourceConfig
-from . import cleanup, config, credentials, doctor, image, worktree
+from .mounts import Mount
+from . import (agent_home, cleanup, config, credentials, doctor, gitdir,
+               image, mounts, worktree)
 
 __all__ = [
     "SandboxBackend", "SandboxSpec", "SandboxResult", "LocalDockerBackend",
-    "ResourceConfig", "RunRecord", "worktree", "credentials", "config",
-    "image", "doctor", "cleanup", "__version__",
+    "ResourceConfig", "RunRecord", "Mount", "worktree", "credentials",
+    "config", "image", "doctor", "cleanup", "agent_home", "mounts", "gitdir",
+    "__version__",
 ]

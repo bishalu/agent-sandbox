@@ -35,6 +35,9 @@ class RunRecord:
             "image": None,
             "resources": None,
             "credentials": None,
+            "agent_home": None,        # runs/<id>/agent-home (R-18)
+            "mounts": [],              # every declared bind mount (R-16)
+            "trusted_mounts": [],      # the git common-dir set, rw into host state (R-20)
             "containers": [],
             "started_at": None,
             "finished_at": None,
@@ -151,6 +154,9 @@ class RunRecord:
             "network": d.get("network"),
             "resources": d.get("resources"),
             "credentials": d.get("credentials"),
+            "agent_home": d.get("agent_home"),
+            "mounts": d.get("mounts") or [],
+            "trusted_mounts": d.get("trusted_mounts") or [],
             "command": d.get("command"),
             "exit_code": d.get("exit_code"),
             "status": d.get("status"),

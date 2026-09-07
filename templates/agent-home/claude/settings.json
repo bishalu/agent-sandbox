@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(git push*)",
+      "Bash(gh pr*)",
+      "Bash(gh issue*)",
+      "Bash(gh release*)",
+      "Bash(gh repo*)",
+      "Bash(git worktree prune*)",
+      "Bash(git worktree repair*)",
+      "Bash(git worktree remove*)",
+      "Bash(git update-ref*)",
+      "Bash(git reflog*)",
+      "Bash(git gc*)",
+      "Bash(git branch -D*)"
+    ]
+  },
+  "skipDangerousModePermissionPrompt": true
+}

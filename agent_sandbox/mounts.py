@@ -14,6 +14,7 @@ composes them for both `run` and `enter`, so the two entry points cannot
 drift apart.
 """
 
+import os
 import pathlib
 import subprocess
 
@@ -62,6 +63,83 @@ def render(mounts):
     for m in mounts or []:
         args += m.docker_args()
     return args
+
+
+class Plan:
+    """What `run` and `enter` both feed into SandboxSpec: mounts plus env."""
+
+    def __init__(self, mounts=None, env=None, trusted=None, warnings=None):
+        self.mounts = list(mounts or [])
+        self.env = dict(env or {})
+        self.trusted = list(trusted or [])      # subset of mounts: rw into host git state
+        self.warnings = list(warnings or [])
+
+
+def plan_for(workspace, cfg, home=None):
+    """Compose every declared mount and env var for one container (R-16).
+
+    One planner for both entry points, so `enter` reproduces exactly what
+    `run` mounted, re-deriving the git set from the host each time. Order is
+    disclosure order only; Docker sorts by destination when mounting.
+    """
+    from . import gitdir                      # gitdir imports Mount from here
+    plan = Plan()
+    if home is not None:
+        plan.mounts += home.mounts()
+        drift = home.drift()
+        if drift:
+            plan.warnings.append(drift)
+        plan.mounts += skill_mounts(cfg)
+    if workspace.kind == "worktree":
+        common, warning = gitdir.check(workspace.repo)
+        if warning:
+            plan.warnings.append(warning)
+        elif common is not None:
+            git, trusted = gitdir.git_mounts(workspace, common)
+            plan.mounts += git
+            plan.trusted += trusted
+    plan.env.update(git_identity_env(workspace))
+    for m in plan.mounts:
+        m.validate()
+    return plan
+
+
+# ---------------------------------------------------------------- skills
+def skill_mounts(cfg):
+    """Host skill directories, read-only under /root/.claude/skills/ (R-19).
+
+    Each entry of `skill_mounts` in config.json is expanded and symlink-
+    resolved on the host (a ~/.claude/skills entry is usually a symlink into
+    a checkout elsewhere; the container cannot follow a host symlink), must
+    be a directory, and lands at skills/<basename>. Two entries with the same
+    basename would shadow each other, so that is an error too.
+    """
+    from . import config as _config
+    raw = _config.resolve("skill_mounts", None, cfg) or []
+    if not isinstance(raw, list):
+        raise MountError(
+            f"skill_mounts in config.json must be a list of paths, got {type(raw).__name__}",
+            'Example: "skill_mounts": ["~/.claude/skills/sssf"]',
+        )
+    out, seen = [], {}
+    for entry in raw:
+        src = pathlib.Path(os.path.expanduser(str(entry)))
+        real = src.resolve()
+        if not real.is_dir():
+            raise MountError(
+                f"skill_mounts entry is not a directory: {entry} (resolves to {real})",
+                "Fix the path in ~/agent-sandbox/config.json or remove the entry.",
+            )
+        name = src.name
+        if name in seen:
+            raise MountError(
+                f"two skill_mounts entries share the name {name!r}: {seen[name]} and {entry}",
+                "Skills mount by basename; rename or drop one of them.",
+            )
+        seen[name] = entry
+        out.append(Mount(real, f"{CONTAINER_HOME}/.claude/skills/{name}",
+                         read_only=True, purpose="skill"))
+    return out
 
 
 # ---------------------------------------------------------------- git identity

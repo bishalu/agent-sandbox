@@ -11,8 +11,8 @@ import os
 import pathlib
 import sys
 
-from . import (cleanup, config, credentials, doctor, image, resources,
-               worktree)
+from . import (agent_home, cleanup, config, credentials, doctor, gitdir,
+               image, mounts, resources, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
 from .errors import SandboxError
@@ -51,6 +51,14 @@ def _mode_runtime(mode, gvisor):
     return "runc"
 
 
+def _describe_plan(plan):
+    """Disclose every declared mount and every warning before the container starts."""
+    for m in plan.mounts:
+        _eprint(f"[{PROG}] mount: {m.host} → {m.container} ({m.to_dict()['mode']}, {m.purpose})")
+    for w in plan.warnings:
+        _eprint(f"{PROG}: warning: {w}")
+
+
 # ---------------------------------------------------------------- run
 def cmd_run(args, command):
     cfg = config.load_config()
@@ -66,28 +74,42 @@ def cmd_run(args, command):
         _eprint(f"{PROG}: warning: {target} is on the Windows filesystem (/mnt).")
         _eprint("  → Expect slower I/O. A WSL-native clone (e.g. under ~/) is much faster.")
 
+    # Nothing is created before the backend proves it can run: a Docker
+    # outage must not leave an orphan worktree and branch behind (R-20).
+    backend = LocalDockerBackend(strict_caps=args.strict_caps)
+    backend.preflight()
+    mounts.skill_mounts(cfg)            # config errors surface before anything exists
+    if not args.direct:
+        # Decide git-mount eligibility before the worktree and branch exist,
+        # so an unsupported repository shape warns instead of orphaning them.
+        _, git_warning = gitdir.check(worktree.repo_root(target))
+        if git_warning and not args.json:
+            _eprint(f"{PROG}: warning: {git_warning}")
+
     ws = worktree.create(target, direct=args.direct)
     rec = RunRecord(ws.sandbox_id)
 
     try:
         img = config.resolve("image", args.image, cfg)
-        if not args.json:
-            image.ensure(img)
-        else:
-            image.ensure(img, quiet=True)
+        image.ensure(img, quiet=bool(args.json))
 
+        home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=bool(args.json))
         creds = credentials.resolve(
             sandbox_dir=config.RUNS / ws.sandbox_id,
             with_github=args.with_github_auth,
             with_full_claude_state=args.with_full_claude_state,
+            agent_home=home,
         )
+        plan = mounts.plan_for(ws, cfg, home)
 
         rec.update(
             repo=ws.repo, workspace=str(ws.path), workspace_kind=ws.kind,
             branch=ws.branch, command=command or None, mode=mode,
             runtime=_mode_runtime(mode, args.experimental_gvisor),
             network=network, image=img, resources=res.to_dict(),
-            credentials=creds.to_dict(),
+            credentials=creds.to_dict(), agent_home=str(home.path),
+            mounts=[m.to_dict() for m in plan.mounts],
+            trusted_mounts=[m.to_dict() for m in plan.trusted],
         ).save()
 
         if not args.json:
@@ -103,29 +125,34 @@ def cmd_run(args, command):
                         "--cpus/--memory/--pids-limit are NOT enforced for this run.")
             for line in creds.describe():
                 _eprint(f"[{PROG}] credentials: {line}")
+            _describe_plan(plan)
 
-        backend = LocalDockerBackend(strict_caps=args.strict_caps)
         spec = SandboxSpec(
             sandbox_id=ws.sandbox_id, workspace=ws, command=command,
             resources=res, mode=mode, network=network, image=img,
             credentials=creds, read_only_root=args.read_only_root,
             experimental_gvisor=args.experimental_gvisor, record=rec,
-            stream_output=not args.json,
+            stream_output=not args.json, mounts=plan.mounts, env=plan.env,
         )
         result = backend.run(spec)
     finally:
         ws.release()
 
-    # --rm disposes of the workspace, but only on a clean exit. Never delete
-    # useful work after a failure or a timeout (R-04).
+    # --rm disposes of the workspace, but only on a clean exit AND only when
+    # the guard agrees: commits that exist on no other branch, or
+    # uncommitted changes, keep the workspace regardless (R-04, R-20).
     disposed = False
     if args.keep is False and ws.kind != "direct":
         if result.status == "completed":
             try:
-                worktree.remove(ws.sandbox_id, force=True)
+                worktree.remove(ws.sandbox_id, force=False)
                 disposed = True
-            except SandboxError:
+            except SandboxError as e:
                 disposed = False
+                if not args.json:
+                    _eprint(f"[{PROG}] --rm ignored: {e.message}")
+                    for line in str(e.remedy or "").splitlines():
+                        _eprint(f"  → {line}")
         elif not args.json:
             _eprint(f"[{PROG}] --rm ignored: run {result.status}, "
                     "workspace kept so the work is not lost")
@@ -160,26 +187,37 @@ def cmd_enter(args, command):
     mode = config.resolve("mode", args.mode, cfg)
     network = config.resolve("network", args.network, cfg)
     img = config.resolve("image", args.image, cfg)
+
+    backend = LocalDockerBackend(strict_caps=args.strict_caps)
+    backend.preflight()
     image.ensure(img, quiet=bool(args.json))
 
+    # Same helper as `run`: an existing home is never re-seeded, only
+    # checked against the current image (R-18).
+    home = agent_home.ensure(args.sandbox_id, cfg, img, quiet=bool(args.json))
     creds = credentials.resolve(
         sandbox_dir=config.RUNS / args.sandbox_id,
         with_github=args.with_github_auth,
         with_full_claude_state=args.with_full_claude_state,
+        agent_home=home,
     )
+    plan = mounts.plan_for(ws, cfg, home)
     rec.update(resources=res.to_dict(), credentials=creds.to_dict(),
-               mode=mode, network=network, image=img).save()
+               mode=mode, network=network, image=img,
+               agent_home=str(home.path),
+               mounts=[m.to_dict() for m in plan.mounts],
+               trusted_mounts=[m.to_dict() for m in plan.trusted]).save()
 
     if not args.json:
         _eprint(f"[{PROG}] re-entering {args.sandbox_id} → {ws.path}")
+        _describe_plan(plan)
 
-    backend = LocalDockerBackend(strict_caps=args.strict_caps)
     spec = SandboxSpec(
         sandbox_id=args.sandbox_id, workspace=ws, command=command,
         resources=res, mode=mode, network=network, image=img,
         credentials=creds, read_only_root=args.read_only_root,
         experimental_gvisor=args.experimental_gvisor, record=rec,
-        stream_output=not args.json,
+        stream_output=not args.json, mounts=plan.mounts, env=plan.env,
     )
     result = backend.run(spec)
     if args.json:

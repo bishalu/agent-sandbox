@@ -75,11 +75,13 @@ def _api_key_from_env():
     return None, None
 
 
-def _sanitized_claude_config(dest_dir):
-    """Layer 2: build a minimal Claude config from host state.
+def sanitized_claude_state():
+    """The minimal Claude config dict built from host state (layer 2).
 
     Copies only the fields Claude Code needs to consider itself configured,
     deliberately excluding projects, history, MCP servers, and identifiers.
+    Shared by the read-only generated file below and by the per-sandbox
+    writable .claude.json in agent_home.py (R-18).
     """
     keep = ("hasCompletedOnboarding", "theme", "autoUpdates",
             "hasTrustDialogAccepted", "installMethod")
@@ -93,18 +95,27 @@ def _sanitized_claude_config(dest_dir):
         except (ValueError, OSError):
             pass
     out.setdefault("hasCompletedOnboarding", True)
+    return out
+
+
+def _sanitized_claude_config(dest_dir):
+    """Layer 2 (no agent home): write the minimal config for a read-only mount."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / "claude.json"
-    path.write_text(json.dumps(out, indent=2) + "\n")
+    path.write_text(json.dumps(sanitized_claude_state(), indent=2) + "\n")
     path.chmod(0o600)
     return path
 
 
 def resolve(sandbox_dir=None, with_github=False, with_full_claude_state=False,
-            force_layer=None):
+            force_layer=None, agent_home=None):
     """Build the credential plan for one run.
 
     sandbox_dir: per-run scratch dir for generated config (layer 2).
+    agent_home:  when the sandbox has a persistent agent home (R-18), the
+                 layer-2 config lives inside it as a writable per-sandbox
+                 .claude.json instead of a read-only generated mount, so
+                 Claude Code can persist trust and bypass acknowledgements.
     """
     c = Credentials()
 
@@ -151,7 +162,13 @@ def resolve(sandbox_dir=None, with_github=False, with_full_claude_state=False,
         # Layer 2 companion: a sanitized config so Claude Code does not treat
         # the container as a fresh unonboarded install. Contains no secrets
         # and no host project data.
-        if sandbox_dir:
+        if agent_home is not None:
+            c.layer = 2
+            c.exposed.append(
+                f"{agent_home.claude / '.claude.json'} (read-write, per sandbox) — "
+                "generated minimal Claude config (onboarding flags and /workspace "
+                "trust only, no host project data)")
+        elif sandbox_dir:
             cfg = _sanitized_claude_config(pathlib.Path(sandbox_dir))
             c.mounts.append(f"{cfg}:{CONTAINER_HOME}/.claude.json:ro")
             c.layer = 2

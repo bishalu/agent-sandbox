@@ -41,6 +41,13 @@ DEFAULTS = {
     "network": "full",
     "image": IMAGE_NAME,
     "disk_warn_gb": 40,
+    # Persistent agent home (R-18): the template every new sandbox's
+    # /root/.claude is seeded from. Relative to nothing; give an absolute path.
+    "agent_home_template": str(ROOT / "templates" / "agent-home"),
+    # Host skill directories mounted read-only into every sandbox's
+    # /root/.claude/skills/<basename> (R-19). List-valued: edit config.json
+    # by hand; `config set` handles scalars only.
+    "skill_mounts": [],
 }
 
 _ENV = {
