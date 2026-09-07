@@ -13,7 +13,7 @@ without going through the CLI:
     result = LocalDockerBackend().run(spec)
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from .backend import SandboxBackend, SandboxResult, SandboxSpec
 from .docker_backend import LocalDockerBackend
