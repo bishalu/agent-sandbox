@@ -222,6 +222,14 @@ records them under `seeded`. Motivation: the vibeset-dj factory ran a full
 chain against a worktree with no `.env`, silently measuring a degraded
 source set, because gitignored files never cross `git worktree add`.
 
+## M10 — v1.2: resume by default (R-04)
+
+One commit. `cmd_run` looks up intact sandboxes of the target repository
+before creating anything; one match is re-entered, several are offered on a
+terminal, `--new` skips the lookup. Motivation: `agent-sandbox .` after a
+pause created a second sandbox with an empty agent home, and the engineer
+could not find their conversations.
+
 ## Risks
 
 | Risk | Mitigation |

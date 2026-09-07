@@ -60,9 +60,79 @@ def _describe_plan(plan):
 
 
 # ---------------------------------------------------------------- run
+def _resumable(target):
+    """Existing, intact sandboxes of the repository `target` lives in, newest first.
+
+    Direct workspaces are never resumed (they are the live checkout), and a
+    record whose worktree is gone cannot be re-entered.
+    """
+    root = worktree.repo_root(target) or target
+    out = []
+    for r in RunRecord.all():
+        d = r.data
+        if d.get("workspace_kind") == "direct":
+            continue
+        if not d.get("repo") or pathlib.Path(d["repo"]).resolve() != root.resolve():
+            continue
+        if not d.get("workspace") or not pathlib.Path(d["workspace"]).exists():
+            continue
+        out.append(r)
+    out.sort(key=lambda r: r.data.get("created_at") or "", reverse=True)
+    return out
+
+
+def _pick_resume(existing, args):
+    """Several sandboxes for one repo: ask on a terminal, refuse otherwise.
+
+    Returns a sandbox id, None for "make a new one", or raises SystemExit(1)
+    when there is no terminal to ask.
+    """
+    if args.json or not sys.stdin.isatty() or not sys.stderr.isatty():
+        _eprint(f"{PROG}: error: several sandboxes exist for this repository; "
+                "say which one:")
+        for r in existing:
+            _eprint(f"  {PROG} enter {r.sandbox_id}")
+        _eprint(f"  {PROG} {args.repo} --new        # a fresh sandbox instead")
+        raise SystemExit(1)
+    _eprint(f"[{PROG}] this repository has {len(existing)} sandboxes:")
+    for i, r in enumerate(existing, 1):
+        d = r.data
+        _eprint(f"  {i}) {r.sandbox_id:<28} {d.get('status', '?'):<10} "
+                f"{cleanup.age_days(r):>4.1f}d  {d.get('branch') or ''}")
+    _eprint(f"  n) new sandbox")
+    while True:
+        try:
+            ans = input(f"[{PROG}] resume which? [1] ").strip().lower() or "1"
+        except EOFError:
+            raise SystemExit(1)
+        if ans == "n":
+            return None
+        if ans.isdigit() and 1 <= int(ans) <= len(existing):
+            return existing[int(ans) - 1].sandbox_id
+        _eprint(f"  enter 1-{len(existing)} or n")
+
+
 def cmd_run(args, command):
     cfg = config.load_config()
     config.ensure_dirs()
+
+    # Resume by default (R-04): a repository that already has a sandbox gets
+    # that sandbox back, with its worktree, branch, and agent home, so the
+    # conversation and the work continue. --new asks for a fresh one; --direct
+    # never resumes because it is the live checkout, not a sandbox.
+    if not args.direct and not args.new:
+        existing = _resumable(pathlib.Path(args.repo).expanduser().resolve())
+        resume_id = None
+        if len(existing) == 1:
+            resume_id = existing[0].sandbox_id
+        elif len(existing) > 1:
+            resume_id = _pick_resume(existing, args)
+        if resume_id:
+            if not args.json:
+                _eprint(f"[{PROG}] resuming {resume_id} "
+                        f"(this repository's sandbox; --new for a fresh one)")
+            args.sandbox_id = resume_id
+            return cmd_enter(args, command)
 
     mode = config.resolve("mode", args.mode, cfg)
     network = config.resolve("network", args.network, cfg)
@@ -185,7 +255,8 @@ def cmd_run(args, command):
                 _eprint(f"[{PROG}] workspace removed (--rm)")
             else:
                 _eprint(f"[{PROG}] workspace preserved: {ws.path}")
-                _eprint(f"[{PROG}] reopen with: {PROG} enter {ws.sandbox_id}")
+                _eprint(f"[{PROG}] resume with: {PROG} {args.repo}   "
+                        f"(or: {PROG} enter {ws.sandbox_id}; --new for a fresh one)")
     return result.exit_code
 
 
@@ -376,7 +447,8 @@ def build_parser():
                     "hardened, disposable rootless-Docker container.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""examples:
-  {PROG} .                          isolated worktree, interactive shell
+  {PROG} .                          this repo's sandbox (resumed), or a new one
+  {PROG} . --new                    a fresh sandbox, even if one exists
   {PROG} ~/code/app -- claude       run Claude Code in a sandbox
   {PROG} . -- npm test              one-shot command
   {PROG} . --direct -- pytest       operate on the live checkout (locked)
@@ -421,6 +493,9 @@ def build_parser():
     sp.add_argument("repo")
     sp.add_argument("--direct", action="store_true",
                     help="operate on the live checkout instead of a worktree")
+    sp.add_argument("--new", action="store_true",
+                    help="create a fresh sandbox even if this repository already "
+                         "has one (the default resumes it)")
     add_run_flags(sp)
 
     sp = sub.add_parser("enter", help="reopen an existing sandbox workspace")

@@ -5,7 +5,8 @@ a hardened, disposable rootless-Docker container. The container is thrown away;
 the work survives.
 
 ```bash
-agent-sandbox .                      # isolated worktree, interactive shell
+agent-sandbox .                      # this repo's sandbox, resumed (or created)
+agent-sandbox . --new                # a fresh sandbox even if one exists
 agent-sandbox ~/code/app -- claude   # run Claude Code in a sandbox
 agent-sandbox . -- npm test          # one-shot command
 ```

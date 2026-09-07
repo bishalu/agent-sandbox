@@ -83,6 +83,11 @@ mark run `timed_out` (distinct from `failed`).
 - create worktree at `~/agent-sandbox/worktrees/<sandbox-id>/`
 - new branch per run: `agent-sandbox/<repo-slug>-<short-id>`
 - persist after exit by default; never auto-deleted on failure
+- `run` against a repository that already has an intact, non-direct sandbox
+  resumes it (the `enter` path: same worktree, branch, and agent home) rather
+  than creating another. Several candidates: a terminal is asked which,
+  newest first; without a terminal, or with `--json`, it is an error naming
+  them. `--new` always creates a fresh one; `--direct` never resumes.
 - `--direct` operates on the live checkout, guarded by an advisory per-repo
   lock (PID + timestamp, stale locks auto-cleared); worktree mode takes no lock
 - non-git paths supported via a copied workspace
@@ -115,7 +120,8 @@ Nothing baked into the image; nothing copied into git.
 
 ### R-08 CLI
 ```
-agent-sandbox <repo> [-- <command...>]
+agent-sandbox <repo> [-- <command...>]          resumes the repo's sandbox, or creates one
+agent-sandbox <repo> --new [-- <command...>]    always a fresh sandbox
 agent-sandbox <repo> --direct [-- <command...>]
 agent-sandbox list
 agent-sandbox enter <sandbox-id>
