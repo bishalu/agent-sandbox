@@ -225,9 +225,12 @@ def unpushed_commits(path):
     path = pathlib.Path(path)
     if not path.exists() or not is_git_repo(path):
         return 0
+    # --exclude patterns for --branches are matched against the short name
+    # (no refs/heads/ prefix); with the prefix the sandbox branch was never
+    # excluded and this always returned 0, so the guard never fired.
     p = subprocess.run(
         ["git", "-C", str(path), "log", "--oneline", "HEAD", "--not",
-         "--exclude=refs/heads/agent-sandbox/*", "--branches", "--remotes"],
+         "--exclude=agent-sandbox/*", "--branches", "--remotes"],
         capture_output=True, text=True,
     )
     if p.returncode != 0:
@@ -273,6 +276,12 @@ def remove(sandbox_id, force=False):
             )
 
     repo = rec.data.get("repo") if rec else None
+    # Never delete anything inside the host repository's git directory, which
+    # a 1.1 sandbox mounts read-write (R-20). Only the worktree, its branch,
+    # and our own run directory are ours to remove.
+    from .gitdir import guard_removal
+    guard_removal(path, repo)
+    guard_removal(config.RUNS / sandbox_id, repo)
     if repo and pathlib.Path(repo).exists() and kind == "worktree":
         subprocess.run(["git", "-C", str(repo), "worktree", "remove",
                         "--force", str(path)], capture_output=True, text=True)
