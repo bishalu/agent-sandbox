@@ -5,16 +5,33 @@ trivial container, because `docker info` succeeding does not prove the
 runtime can start one.
 """
 
+import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import subprocess
+import tempfile
+import time
 
-from . import cleanup, config, credentials, image
+from . import (agent_home, cleanup, config, credentials, image, mounts,
+               resources, worktree)
+from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
+from .errors import SandboxError
+from .metadata import RunRecord
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+
+# Doctor output lands in evidence files; never let a value that looks like a
+# secret through, whatever a probe printed (R-22).
+_SECRET_KV = re.compile(r"((?:[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET)[A-Za-z0-9_]*)\s*[=:]\s*)(\S+)",
+                        re.IGNORECASE)
+
+
+def redact(text):
+    return _SECRET_KV.sub(lambda m: m.group(1) + "[redacted]", text or "")
 
 
 class Check:
@@ -37,9 +54,10 @@ def _sh(args):
         return None
 
 
-def run_checks(quick=False):
+def run_checks(quick=False, with_quota=False):
     checks = []
     env = config.docker_env()
+    cfg = config.load_config()
 
     # --- platform ---
     is_wsl = "microsoft" in platform.uname().release.lower()
@@ -250,6 +268,202 @@ def run_checks(quick=False):
             "     systemctl --user restart docker",
         ))
 
+    # ------------------------------------------------------------ v1.1 (R-16..R-22)
+    checks += _host_checks(cfg)
+    if not quick and not need:
+        checks += _sandbox_probe(cfg, with_quota=with_quota)
+    elif need:
+        checks.append(Check("worktree sandbox probe", WARN, "skipped: image not built",
+                            "Run `agent-sandbox build` first."))
+    checks += _drift_checks()
+    return checks
+
+
+# ---------------------------------------------------------------- v1.1 checks
+def _throwaway_repo():
+    d = pathlib.Path(tempfile.mkdtemp(prefix="agent-sandbox-doctor-"))
+    subprocess.run(["git", "init", "-q", "-b", "main", str(d)], check=True)
+    subprocess.run(["git", "-C", str(d), "config", "user.email", "doctor@agent-sandbox.local"], check=True)
+    subprocess.run(["git", "-C", str(d), "config", "user.name", "agent-sandbox doctor"], check=True)
+    (d / "README").write_text("doctor probe\n")
+    subprocess.run(["git", "-C", str(d), "add", "README"], check=True)
+    subprocess.run(["git", "-C", str(d), "commit", "-q", "-m", "probe"], check=True)
+    return d
+
+
+def _host_checks(cfg):
+    checks = []
+
+    # --- git identity resolves (R-17) ---
+    d = _throwaway_repo()
+    try:
+        env = mounts.git_identity_env(worktree.Workspace("doctor", d, "worktree", repo=d))
+        checks.append(Check("git identity", PASS,
+                            f"resolves ({env['GIT_AUTHOR_EMAIL']} for a repo with a local identity)"))
+    except SandboxError as e:
+        checks.append(Check("git identity", FAIL, e.message, e.remedy or ""))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    glob_email = subprocess.run(["git", "config", "--global", "user.email"],
+                                capture_output=True, text=True).stdout.strip()
+    checks.append(Check(
+        "global git identity", PASS if glob_email else WARN,
+        glob_email or "not set",
+        "" if glob_email else "git config --global user.email ... / user.name ...\n"
+                              "     Repos without a local identity cannot commit inside a sandbox.",
+    ))
+
+    # --- skill mounts (R-19) ---
+    try:
+        sk = mounts.skill_mounts(cfg)
+        checks.append(Check("skill mounts", PASS,
+                            ", ".join(str(m.host) for m in sk) if sk else "none configured"))
+    except SandboxError as e:
+        checks.append(Check("skill mounts", FAIL, e.message, e.remedy or ""))
+
+    # --- agent home template (R-18) ---
+    try:
+        t = agent_home._template_dir(cfg)
+        checks.append(Check("agent home template", PASS, str(t)))
+    except SandboxError as e:
+        checks.append(Check("agent home template", FAIL, e.message, e.remedy or ""))
+
+    # --- credential expiry (R-18, D18): only the expiry field is read ---
+    f = credentials.CREDENTIALS_FILE
+    if f.exists():
+        try:
+            exp_ms = json.loads(f.read_text()).get("claudeAiOauth", {}).get("expiresAt")
+        except (ValueError, OSError):
+            exp_ms = None
+        if exp_ms:
+            left = exp_ms / 1000.0 - time.time()
+            mins = int(left // 60)
+            soon = left < 3600
+            checks.append(Check(
+                "Claude access token expiry", WARN if soon else PASS,
+                f"{'expired' if left < 0 else f'{mins} min left'}",
+                "" if not soon else
+                "The read-only credentials mount cannot persist a refresh inside a sandbox.\n"
+                "     Run `claude` on the host once to refresh before a long run, or see the\n"
+                "     README on CLAUDE_CODE_OAUTH_TOKEN if refresh proves unreliable.",
+            ))
+    return checks
+
+
+def _sandbox_probe(cfg, with_quota=False):
+    """One throwaway repo, two containers: commit, overlays, bridge, gate, persistence."""
+    checks = []
+    repo = _throwaway_repo()
+    ws = None
+    try:
+        ws = worktree.create(repo)
+        img = config.resolve("image", None, cfg)
+        home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=True)
+        creds = credentials.resolve(sandbox_dir=config.RUNS / ws.sandbox_id, agent_home=home)
+        plan = mounts.plan_for(ws, cfg, home)
+        res = resources.ResourceConfig("1", "1g", "256", "5m", cfg)
+        backend = LocalDockerBackend()
+
+        def run(cmd):
+            rec = RunRecord.load(ws.sandbox_id) or RunRecord(ws.sandbox_id)
+            spec = SandboxSpec(ws.sandbox_id, ws, ["bash", "-lc", cmd], resources=res,
+                               image=img, credentials=creds, record=rec,
+                               stream_output=False, mounts=plan.mounts, env=plan.env)
+            r = backend.run(spec)
+            out = rec.stdout_log.read_text() if rec.stdout_log.exists() else ""
+            return r, redact(out)
+
+        script1 = (
+            "echo x > probe && git add probe && git commit -qm probe && echo COMMIT_OK;"
+            " C=$(git rev-parse --path-format=absolute --git-common-dir);"
+            " (touch \"$C/hooks/doctor\" 2>/dev/null && echo HOOK_WRITABLE) || echo HOOK_RO;"
+            " git worktree prune && echo PRUNE_OK;"
+            " echo BRIDGE_TEMPLATE=$(PI_CODING_AGENT_DIR=/opt/agent-sandbox/pi-agent-template pi --list-models 2>/dev/null | grep -c claude-bridge);"
+            " echo BRIDGE_HOME=$(pi --list-models 2>/dev/null | grep -c claude-bridge);"
+            " mkdir -p /tmp/nocreds && G=$(CLAUDE_CONFIG_DIR=/tmp/nocreds claude -p hi --dangerously-skip-permissions 2>&1 | head -c 400);"
+            " case \"$G\" in *'cannot be used with root'*) echo GATE_CLOSED;; *'ot logged in'*|*'login'*|*'Login'*) echo GATE_OPEN;; *) echo \"GATE_UNKNOWN: $G\";; esac;"
+            " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN"
+        )
+        r1, out1 = run(script1)
+        ok = r1.status == "completed" and "COMMIT_OK" in out1
+        on_host = subprocess.run(["git", "-C", str(ws.path), "log", "--oneline"],
+                                 capture_output=True, text=True).stdout.count("\n")
+        checks.append(Check(
+            "worktree sandbox commit", PASS if ok and on_host >= 2 else FAIL,
+            "commit inside the sandbox is visible on the host branch" if ok and on_host >= 2
+            else f"status={r1.status}; {out1.strip()[-300:]}",
+            "" if ok and on_host >= 2 else
+            "Git inside the worktree sandbox failed. Check the trusted mounts in\n"
+            f"     runs/{ws.sandbox_id}/run.json and the container log.",
+        ))
+        checks.append(Check(
+            "git overlays read-only", PASS if "HOOK_RO" in out1 else FAIL,
+            "hooks/ refused a write" if "HOOK_RO" in out1 else "hooks/ accepted a write",
+            "" if "HOOK_RO" in out1 else "The .git/hooks overlay is missing; a sandboxed agent could plant a hook.",
+        ))
+        checks.append(Check(
+            "worktree prune is a no-op", PASS if "PRUNE_OK" in out1 and on_host >= 2 else FAIL,
+            "prune inside the container kept the worktree",
+        ))
+        bt = re.search(r"BRIDGE_TEMPLATE=(\d+)", out1)
+        bh = re.search(r"BRIDGE_HOME=(\d+)", out1)
+        ok_b = bt and bh and int(bt.group(1)) > 0 and int(bh.group(1)) > 0
+        checks.append(Check(
+            "pi-claude-bridge models", PASS if ok_b else FAIL,
+            f"image template: {bt.group(1) if bt else '?'}, seeded home: {bh.group(1) if bh else '?'}",
+            "" if ok_b else "Rebuild the image (`agent-sandbox build`); the bridge did not load.",
+        ))
+        gate = "GATE_OPEN" if "GATE_OPEN" in out1 else ("GATE_CLOSED" if "GATE_CLOSED" in out1 else "unknown")
+        checks.append(Check(
+            "root bypass gate (IS_SANDBOX)", PASS if gate == "GATE_OPEN" else FAIL,
+            "Claude Code accepts bypass as root inside the sandbox (no quota spent)"
+            if gate == "GATE_OPEN" else f"{gate}: {out1.strip()[-200:]}",
+            "" if gate == "GATE_OPEN" else "IS_SANDBOX=1 is not reaching claude; check the image env.",
+        ))
+
+        # Second container over the same sandbox: does the home persist?
+        r2, out2 = run("test -f /root/.claude/doctor-marker && echo MARKER_PERSISTED"
+                       + (" ; claude -p 'Reply with exactly: DOCTOR_OK' --output-format json --max-turns 1 2>&1 | grep -o '\"result\":\"[^\"]*\"'"
+                          if with_quota else ""))
+        persisted = "MARKER_PERSISTED" in out2
+        checks.append(Check(
+            "agent home persists across runs", PASS if persisted else FAIL,
+            "file written in run 1 present in run 2" if persisted else out2.strip()[-200:],
+            "" if persisted else "The agent home mount is not persisting; check runs/<id>/agent-home.",
+        ))
+        if with_quota:
+            ok_q = "DOCTOR_OK" in out2
+            checks.append(Check("authenticated claude -p (quota spent)", PASS if ok_q else FAIL,
+                                "DOCTOR_OK" if ok_q else out2.strip()[-200:],
+                                "" if ok_q else "Log in with `claude` on the host."))
+    except SandboxError as e:
+        checks.append(Check("worktree sandbox probe", FAIL, e.message, e.remedy or ""))
+    except Exception as e:  # a probe must never take doctor down with it
+        checks.append(Check("worktree sandbox probe", FAIL, f"{type(e).__name__}: {e}"))
+    finally:
+        if ws is not None:
+            try:
+                worktree.remove(ws.sandbox_id, force=True)
+            except Exception:
+                pass
+        shutil.rmtree(repo, ignore_errors=True)
+    return checks
+
+
+def _drift_checks():
+    """Existing sandboxes whose agent home predates the current image (R-18)."""
+    checks = []
+    drifted = []
+    for rec in RunRecord.all():
+        home = agent_home.load(rec.sandbox_id)
+        if home and home.drift():
+            drifted.append(rec.sandbox_id)
+    if drifted:
+        checks.append(Check(
+            "agent home drift", WARN, ", ".join(drifted),
+            "These sandboxes were seeded from an older image. Re-seed with\n"
+            "     agent-sandbox rm <id> && agent-sandbox <repo>  (or keep using them knowingly).",
+        ))
     return checks
 
 

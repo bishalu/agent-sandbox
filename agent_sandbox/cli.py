@@ -301,7 +301,7 @@ def cmd_clean(args):
 
 # ---------------------------------------------------------------- doctor
 def cmd_doctor(args):
-    checks = doctor.run_checks(quick=args.quick)
+    checks = doctor.run_checks(quick=args.quick, with_quota=args.with_quota)
     if args.json:
         print(json.dumps({"checks": [c.to_dict() for c in checks],
                           "summary": doctor.summarize(checks)}, indent=2))
@@ -426,6 +426,9 @@ def build_parser():
     sp = sub.add_parser("doctor", help="verify the environment end to end")
     sp.add_argument("--quick", action="store_true",
                     help="skip the real container execution check")
+    sp.add_argument("--with-quota", action="store_true",
+                    help="also run one authenticated `claude -p` inside the probe "
+                         "sandbox (spends a little of your Claude quota)")
     sp.add_argument("--json", action="store_true")
 
     sp = sub.add_parser("build", help="build the base image")
