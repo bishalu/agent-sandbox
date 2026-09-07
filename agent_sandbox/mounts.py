@@ -98,6 +98,10 @@ def plan_for(workspace, cfg, home=None):
             git, trusted = gitdir.git_mounts(workspace, common)
             plan.mounts += git
             plan.trusted += trusted
+        else:
+            plan.warnings.append(
+                f"source repository {workspace.repo} no longer resolves as a git "
+                "repository; git will not work inside this sandbox.")
     plan.env.update(git_identity_env(workspace))
     for m in plan.mounts:
         m.validate()
@@ -164,6 +168,11 @@ def git_identity_env(workspace):
     if workspace.kind == "copy" or not workspace.repo:
         return {}
     repo = workspace.repo
+    if not pathlib.Path(repo).exists():
+        # The source repository moved or was deleted: plan_for warns that git
+        # will not work in this sandbox; an identity error on top would hide
+        # that warning behind a less useful one.
+        return {}
     name = _git_config(repo, "user.name")
     email = _git_config(repo, "user.email")
     if not name or not email:

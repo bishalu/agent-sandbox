@@ -237,7 +237,7 @@ permits, usage documented. Existing repos not modified during testing.
   pointing at the image's `claude` with `plan: max`, and `models.json` as
   `{"providers": {}}`.
 - `agent-sandbox enter <id>` followed by `claude --resume` continues a session
-  created in an earlier container of the same sandbox.
+  created in an earlier container of the same sandbox. A sandbox created by 1.0 has no home; its first 1.1 `enter` seeds one, with no prior session state to recover. A home whose seeding did not finish (no seed record) is rebuilt on the next run rather than trusted.
 
 ### R-19 Skill mounts
 - `skill_mounts` in `config.json` is a list of host paths. Each is expanded
@@ -253,7 +253,7 @@ permits, usage documented. Existing repos not modified during testing.
   `<repo>/.git` (checked with `git rev-parse --git-common-dir` before the
   worktree is created), the container gets: the common directory read-write
   at its host path; the worktree a second time at its host path; read-only
-  overlays for `.git/config`, `.git/HEAD`, `.git/index`, `.git/hooks`,
+  overlays for `.git/config`, `.git/config.worktree`, `.git/HEAD`, `.git/index`, `.git/hooks`,
   `.git/modules`, and `.git/worktrees`; the sandbox's own
   `.git/worktrees/<id>` read-write on top of the `worktrees` overlay; and its
   `config.worktree` read-only on top of that. The parent checkout is never

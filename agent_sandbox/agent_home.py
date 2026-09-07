@@ -47,7 +47,14 @@ class AgentHome:
 
     @property
     def exists(self):
-        return self.claude.is_dir() and self.pi.is_dir()
+        """Fully seeded: both homes and the seed record. A home whose seeding
+        died halfway (docker cp failed, disk full) has no seed record and is
+        rebuilt on the next run instead of being trusted forever."""
+        return self.claude.is_dir() and self.pi.is_dir() and self.seed_file.is_file()
+
+    @property
+    def partial(self):
+        return self.path.exists() and not self.exists
 
     def seed(self):
         try:
@@ -164,14 +171,20 @@ def ensure(sandbox_id, cfg=None, img=None, quiet=False):
     home = AgentHome(sandbox_id, home_path(sandbox_id))
     if home.exists:
         return home
+    if home.partial:
+        # A previous seeding did not finish; nothing in it was ever used by a
+        # container (the container only starts after ensure() returns), so
+        # start over rather than serve a home with no bridge and no record.
+        if not quiet:
+            print(f"[agent-sandbox] re-seeding incomplete agent home {home.path}",
+                  flush=True)
+        shutil.rmtree(home.path, ignore_errors=True)
 
     template = _template_dir(cfg)
     _mkdir_private(home.path)
 
     # Claude home. Files copied from the template keep their content; the
     # directory tree is private to the invoking user.
-    if home.claude.exists():
-        shutil.rmtree(home.claude)
     shutil.copytree(template / "claude", home.claude)
     _mkdir_private(home.claude)
     _mkdir_private(home.claude / "skills")
@@ -179,8 +192,10 @@ def ensure(sandbox_id, cfg=None, img=None, quiet=False):
     state_file = home.claude / ".claude.json"
     state_file.write_text(json.dumps(_claude_state(), indent=2) + "\n")
     state_file.chmod(0o600)
+    # Valid JSON, not zero bytes: under credential layer 3 or 0 nothing is
+    # mounted over it and Claude Code reads it as-is.
     creds_placeholder = home.claude / ".credentials.json"
-    creds_placeholder.touch()
+    creds_placeholder.write_text("{}\n")
     creds_placeholder.chmod(0o600)
 
     # Pi home, from the image.

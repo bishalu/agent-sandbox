@@ -255,7 +255,9 @@ def remove(sandbox_id, force=False):
                 "There is no sandbox workspace to delete. To clear just its run "
                 f"record and logs:\n  agent-sandbox rm {sandbox_id} --force",
             )
+        from .gitdir import guard_removal
         run_dir = config.RUNS / sandbox_id
+        guard_removal(run_dir, rec.data.get("repo") if rec else None)
         if run_dir.exists():
             shutil.rmtree(run_dir, ignore_errors=True)
         return True

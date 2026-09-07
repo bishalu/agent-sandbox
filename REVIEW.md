@@ -217,3 +217,25 @@ All seven new requirements pass, plus the 1.1 changes to R-07 and R-11.
 Three gaps were found and fixed, one of them (Gap 8) a latent 1.0 defect that
 the new `--rm` path exposed. Three further deviations are documented with
 their justification. No requirement is silently unmet.
+
+### Repair cycle 1 (M1 independent review, 2026-09-07)
+
+Findings F1 to F3 (major) and F4 to F14 (minor/notes) from the milestone review, fixed and re-verified:
+
+| Finding | Fix | Observed |
+|---|---|---|
+| F1 partial agent home trusted forever | `AgentHome.exists` requires `seed.json`; a partial home is removed and re-seeded | A home with `claude/` and `pi-agent/` but no seed record reported `exists: False partial: True`; `ensure()` printed `re-seeding incomplete agent home`, and afterwards `exists: True`, seed present, bridge package present |
+| F2 failure between `worktree.create` and the first record save orphaned an invisible sandbox | `run.json` is saved with repo, workspace, kind and branch immediately after `worktree.create` | With no resolvable git identity the run failed after the worktree existed; `agent-sandbox list` showed `r1-30bc7a93  created`, `rm --force` removed it, and the source repo had 1 worktree left |
+| F3 main checkout's `config.worktree` writable | `config.worktree` added to the read-only overlay set (stand-in when absent) | Inside the container `echo x > <common>/config.worktree` failed with `Read-only file system` |
+| F4 zero-byte credentials placeholder | placeholder is `{}` | `.credentials.json` in a fresh home reads `{}` |
+| F5 redactor coverage | pattern accepts quoted keys, masks bare `sk-ant-` tokens; `cmd_doctor` redacts every check | `"accessToken": "sk-ant-oat01-..."`, `GH_TOKEN=xyz` and a bare `sk-ant-api03-...` all rendered `[redacted]` |
+| F6 moved source repo silently lost git | warning appended when the recorded repo no longer resolves; identity resolution skips a missing repo | see re-test below |
+| F7 pre-1.1 sandbox seeding undocumented | README and SPEC R-18 sentence added | n/a |
+| F8 test residue | `runs/t-repo-e6bc8b92` and its worktree removed | `runs/` and `worktrees/` hold only `fingerprinting-28fa9117` |
+| F9 deny list gaps | added `gh api|workflow|secret|gist`, `git -C * push`, `git branch --delete` | Under bypass, `claude -p` asked to run `git push origin main` reported the permission request was denied and nothing was pushed |
+| F10 build context | `image/.dockerignore` with `node_modules/` | image rebuilt |
+| F12 `--read-only-root` with the agent home | tested | a file written to `/root/.claude` under `--read-only-root` was present after `enter --read-only-root` |
+| F13 `models.json` wording | sssf SPEC S3 and PLAN R5 updated to `{"providers": {}}` | n/a |
+| F14 direct-kind removal guard | `guard_removal` runs before the direct-kind `rmtree` | n/a |
+
+Additional scenarios from the reviewer's untested list, observed: two sandboxes of one repo have disjoint homes (a marker written in one was absent in the other); `rm --force` deleted the agent home with the run record; a copy-kind workspace received no `GIT_AUTHOR_*` variables; `--json` output carried `agent_home`, `mounts`, and `trusted_mounts`; a repo with no `.git/hooks` got read-only stand-ins for `hooks`, `modules`, and `config.worktree`; `git worktree prune` inside the container left a sibling host worktree registered (3 entries before and after); `doctor --quick` reported `[FAIL] skill mounts` for a missing entry and `[WARN] agent home drift` for a sandbox whose seed record named a stale fingerprint.

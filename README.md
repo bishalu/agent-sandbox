@@ -157,7 +157,7 @@ and mounted read-write:
 
 The home is seeded once, on the sandbox's first run, and `enter` never
 re-seeds it. `claude --resume` after `agent-sandbox enter <id>` lists and
-continues the session you left. The home lives until `agent-sandbox rm <id>`.
+continues the session you left. The home lives until `agent-sandbox rm <id>`. A sandbox created by 1.0 has no home; its first 1.1 `enter` seeds one, with no prior session state to recover. A home whose seeding did not finish (no seed record) is rebuilt on the next run rather than trusted.
 
 When the image is rebuilt, existing homes keep their older tools. `run`,
 `enter`, and `doctor` print a drift warning naming the sandbox; re-seed with
@@ -194,7 +194,7 @@ worktree sandbox additionally mounts, at their host paths:
 | `<repo>/.git` (the common directory) | read-write |
 | the worktree itself, a second time | read-write |
 | `.git/worktrees/<id>` (this sandbox's admin dir) | read-write |
-| `.git/config`, `.git/HEAD`, `.git/index` | read-only overlay |
+| `.git/config`, `.git/config.worktree`, `.git/HEAD`, `.git/index` | read-only overlay |
 | `.git/hooks`, `.git/modules`, `.git/worktrees` | read-only overlay |
 | `.git/worktrees/<id>/config.worktree` | read-only overlay |
 

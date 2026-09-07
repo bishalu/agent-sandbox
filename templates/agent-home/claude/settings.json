@@ -3,17 +3,23 @@
     "defaultMode": "bypassPermissions",
     "deny": [
       "Bash(git push*)",
+      "Bash(git -C * push*)",
       "Bash(gh pr*)",
       "Bash(gh issue*)",
       "Bash(gh release*)",
       "Bash(gh repo*)",
+      "Bash(gh api*)",
+      "Bash(gh workflow*)",
+      "Bash(gh secret*)",
+      "Bash(gh gist*)",
       "Bash(git worktree prune*)",
       "Bash(git worktree repair*)",
       "Bash(git worktree remove*)",
       "Bash(git update-ref*)",
       "Bash(git reflog*)",
       "Bash(git gc*)",
-      "Bash(git branch -D*)"
+      "Bash(git branch -D*)",
+      "Bash(git branch --delete*)"
     ]
   },
   "skipDangerousModePermissionPrompt": true

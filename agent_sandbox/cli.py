@@ -88,6 +88,12 @@ def cmd_run(args, command):
 
     ws = worktree.create(target, direct=args.direct)
     rec = RunRecord(ws.sandbox_id)
+    # Persist the record the moment the workspace exists: anything that fails
+    # between here and the container start (image build, home seeding,
+    # credentials, mount planning) must leave a sandbox that `list` and `rm`
+    # can see, never an invisible worktree and branch (R-20).
+    rec.update(repo=ws.repo, workspace=str(ws.path), workspace_kind=ws.kind,
+               branch=ws.branch).save()
 
     try:
         img = config.resolve("image", args.image, cfg)
@@ -302,6 +308,10 @@ def cmd_clean(args):
 # ---------------------------------------------------------------- doctor
 def cmd_doctor(args):
     checks = doctor.run_checks(quick=args.quick, with_quota=args.with_quota)
+    # Every line doctor prints may end up in a committed evidence file (R-22).
+    for c in checks:
+        c.detail = doctor.redact(c.detail)
+        c.remedy = doctor.redact(c.remedy)
     if args.json:
         print(json.dumps({"checks": [c.to_dict() for c in checks],
                           "summary": doctor.summarize(checks)}, indent=2))

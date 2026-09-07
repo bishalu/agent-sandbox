@@ -11,6 +11,7 @@ narrowest mount that makes git work:
                                   `git worktree list|prune` sees the
                                   back-pointer as valid instead of prunable
   <repo>/.git/config              read-only   } every path a write could turn
+  <repo>/.git/config.worktree     read-only   } (the main checkout's own)
   <repo>/.git/hooks               read-only   } into code that runs on the host
   <repo>/.git/modules             read-only   } the next time the user runs git
   <repo>/.git/worktrees           read-only   } (fsmonitor, hooks, hooksPath,
@@ -39,7 +40,10 @@ from .mounts import Mount
 
 OVERLAY_DIRNAME = "git-overlays"
 RO_DIRS = ("hooks", "modules", "worktrees")
-RO_FILES = ("config", "HEAD", "index")
+# config.worktree at the common dir is the MAIN checkout's per-worktree config
+# once extensions.worktreeConfig is on (git sets it on sparse-checkout): the
+# same fsmonitor/hooksPath vector as config, so it is overlaid too.
+RO_FILES = ("config", "config.worktree", "HEAD", "index")
 
 
 def common_dir(path):

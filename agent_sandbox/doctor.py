@@ -26,12 +26,17 @@ PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
 
 # Doctor output lands in evidence files; never let a value that looks like a
 # secret through, whatever a probe printed (R-22).
-_SECRET_KV = re.compile(r"((?:[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET)[A-Za-z0-9_]*)\s*[=:]\s*)(\S+)",
-                        re.IGNORECASE)
+_SECRET_KV = re.compile(
+    r"(['\"]?[A-Za-z0-9_]*(?:TOKEN|KEY|SECRET)[A-Za-z0-9_]*['\"]?\s*[=:]\s*)(['\"]?[^\s,'\"]+['\"]?)",
+    re.IGNORECASE)
+# Anthropic-style bearer tokens have a recognisable prefix; mask them even
+# when no key name precedes them.
+_BARE_TOKEN = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")
 
 
 def redact(text):
-    return _SECRET_KV.sub(lambda m: m.group(1) + "[redacted]", text or "")
+    out = _SECRET_KV.sub(lambda m: m.group(1) + "[redacted]", text or "")
+    return _BARE_TOKEN.sub("[redacted]", out)
 
 
 class Check:
