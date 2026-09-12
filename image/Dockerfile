@@ -58,6 +58,17 @@ RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -
     && rm -rf /tmp/aws /tmp/awscliv2.zip \
     && aws --version
 
+# Terraform, from HashiCorp's apt repository. Tools an agent installs into the
+# container at run time do not survive a restart; only the worktree and the
+# agent home persist, so anything a milestone needs on PATH belongs here.
+RUN curl -fsSL https://apt.releases.hashicorp.com/gpg \
+        | gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(. /etc/os-release && echo $VERSION_CODENAME) main" \
+        > /etc/apt/sources.list.d/hashicorp.list \
+    && apt-get update && apt-get install -y --no-install-recommends terraform \
+    && rm -rf /var/lib/apt/lists/* \
+    && terraform version
+
 # uv and uvx, copied from the official image pinned by digest.
 COPY --from=ghcr.io/astral-sh/uv:0.12.10@sha256:2bb3ebca0a796a155094a27773d290c4b074572e6107f171d88d086682fd2500 \
     /uv /uvx /usr/local/bin/
