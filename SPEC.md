@@ -322,6 +322,11 @@ logs are still preserved (R-03).
   again on every `enter`, overwriting the sandbox's copy, so the host checkout
   is the source of truth for secrets. Missing entries are skipped; `--direct`
   and copy workspaces are unaffected.
+- Every shell inside the container exports `/workspace/.env` when the file
+  exists: `/etc/profile.d/agent-sandbox-dotenv.sh` for login shells, sourced
+  from `/root/.bashrc` for interactive ones, and named by `BASH_ENV` for the
+  non-interactive `bash -c` an agent's tool runner spawns. The values never
+  pass through docker's argument list or the run record.
 - An entry that is present but not gitignored is not copied and produces a
   warning: a tracked path is already in the worktree, and an untracked one
   would be committed from inside the sandbox. An absolute entry, one

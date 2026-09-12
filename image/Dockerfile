@@ -88,6 +88,18 @@ RUN test "$(claude --version | grep -o '[0-9][0-9.]*' | head -1)" = "2.1.263" \
     && PI_CODING_AGENT_DIR=/tmp/pi-agent-check pi --list-models | grep -q claude-bridge \
     && rm -rf /tmp/pi-agent-check
 
+# Every shell in the container exports /workspace/.env when it exists: login
+# shells through profile.d, interactive ones through .bashrc, and the
+# non-interactive `bash -c` an agent's tool runner spawns through BASH_ENV
+# (set at run time). Secrets stay in the seeded file and never pass through
+# docker's argument list.
+RUN printf '%s\n' \
+        '# agent-sandbox: export the seeded workspace .env into every shell' \
+        'if [ -f /workspace/.env ]; then set -a; . /workspace/.env; set +a; fi' \
+        > /etc/profile.d/agent-sandbox-dotenv.sh \
+    && chmod 0644 /etc/profile.d/agent-sandbox-dotenv.sh \
+    && printf '\n. /etc/profile.d/agent-sandbox-dotenv.sh\n' >> /root/.bashrc
+
 # Unprivileged user available on request. uid 1000 matches the common host uid.
 RUN useradd -m -u 1000 -s /bin/bash agent || true
 

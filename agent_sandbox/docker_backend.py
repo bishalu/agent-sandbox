@@ -155,6 +155,8 @@ class LocalDockerBackend(SandboxBackend):
         # Both are also baked into the image; repeating them here means a
         # custom --image cannot silently drop them.
         args += ["-e", "IS_SANDBOX=1"]
+        # Non-interactive shells source the seeded /workspace/.env (R-23).
+        args += ["-e", "BASH_ENV=/etc/profile.d/agent-sandbox-dotenv.sh"]
         args += ["-e", f"CLAUDE_CONFIG_DIR={mounts.CONTAINER_HOME}/.claude"]
         for k, v in (spec.env or {}).items():
             args += ["-e", f"{k}={v}"]
