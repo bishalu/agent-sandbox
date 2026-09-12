@@ -53,6 +53,10 @@ DEFAULTS = {
     # never arrives on its own. Repo-relative files or directories; only
     # entries git ignores are copied. List-valued: edit config.json by hand.
     "worktree_seed": [],
+    # Mirror the host's Claude Code plugins into every sandbox (R-24): the
+    # registries are copied into the agent home and the cache and marketplace
+    # directories mount read-only at their host paths.
+    "mirror_plugins": True,
 }
 
 _ENV = {
@@ -68,7 +72,7 @@ _ENV = {
 
 def ensure_dirs():
     for d in (ROOT, WORKTREES, RUNS, LOGS, LOCK_DIR, IMAGE_DIR,
-              CACHE / "npm", CACHE / "pnpm", CACHE / "pip"):
+              CACHE / "npm", CACHE / "pnpm", CACHE / "pip", CACHE / "uv"):
         d.mkdir(parents=True, exist_ok=True)
 
 

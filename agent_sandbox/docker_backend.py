@@ -124,6 +124,7 @@ class LocalDockerBackend(SandboxBackend):
         args += ["-v", f"{config.CACHE / 'npm'}:/root/.npm"]
         args += ["-v", f"{config.CACHE / 'pnpm'}:/root/.local/share/pnpm/store"]
         args += ["-v", f"{config.CACHE / 'pip'}:/root/.cache/pip"]
+        args += ["-v", f"{config.CACHE / 'uv'}:/root/.cache/uv"]
 
         # --- declared mounts: agent home, skills, git common dir (R-16..R-18) ---
         # Rendered with --mount so a missing host source is an error, never a

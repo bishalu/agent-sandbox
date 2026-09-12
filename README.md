@@ -23,7 +23,7 @@ No per-repository setup, and no assumptions about language or test runner.
 
 **Git works inside.** Commit, branch, rebase, stash, all on the sandbox branch. Push is denied for the Claude operator, and the parts of `.git` that could run code on your host the next time you type `git` are mounted read-only.
 
-**Skills ride along.** Host skill directories mount read-only at `/root/.claude/skills/`, so a factory like [SSSF](https://github.com/bishalu/super-simple-software-factory) runs inside without being copied into the repo.
+**Skills and plugins ride along.** Host skill directories mount read-only at `/root/.claude/skills/`; list `~/.claude/skills` itself and every skill comes. Installed Claude Code plugins are mirrored too, registries copied and their caches mounted read-only at their host paths, so the sandbox runs the same stack as the host. Secrets listed under `worktree_seed` are refreshed on every start.
 
 ## What the agent can reach
 

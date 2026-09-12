@@ -194,7 +194,10 @@ def create(target, sandbox_id=None, direct=False):
 
 
 def seed(ws, paths):
-    """Copy gitignored paths from the source checkout into a fresh worktree (R-23).
+    """Copy gitignored paths from the source checkout into a worktree (R-23).
+
+    Runs on creation and again on every `enter`, overwriting the copies, so the
+    host checkout stays the source of truth for secrets.
 
     `git worktree add` gives a worktree the tracked files only, so the secrets a
     repo keeps in a gitignored `.env` never arrive on their own and an agent

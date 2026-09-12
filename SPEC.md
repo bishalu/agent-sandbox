@@ -249,7 +249,10 @@ permits, usage documented. Existing repos not modified during testing.
 - `skill_mounts` in `config.json` is a list of host paths. Each is expanded
   and symlink-resolved on the host, must be a directory, and is mounted
   read-only at `/root/.claude/skills/<basename>` inside the agent home, on
-  both `run` and `enter`.
+  both `run` and `enter`. An entry that is a directory *of* skills (no
+  `SKILL.md` of its own, children that have one) expands to one mount per
+  child, each child symlink-resolved on its own, so `~/.claude/skills`
+  mirrors the host's whole skill set.
 - A missing or non-directory entry, a non-list value, or two entries sharing
   a basename is a hard error naming the entry, raised before any worktree or
   branch is created. An empty list mounts nothing.
@@ -315,15 +318,29 @@ logs are still preserved (R-03).
 - `worktree_seed` in `config.json` is a list of repo-relative paths (files or
   directories). On `run` against a git repository, each entry that exists in
   the source checkout **and is gitignored there** is copied into the new
-  worktree right after `git worktree add`, permissions preserved. Missing
-  entries are skipped. `enter` never re-seeds; `--direct` and copy workspaces
-  are unaffected.
+  worktree right after `git worktree add`, permissions preserved, and copied
+  again on every `enter`, overwriting the sandbox's copy, so the host checkout
+  is the source of truth for secrets. Missing entries are skipped; `--direct`
+  and copy workspaces are unaffected.
 - An entry that is present but not gitignored is not copied and produces a
   warning: a tracked path is already in the worktree, and an untracked one
   would be committed from inside the sandbox. An absolute entry, one
   containing `..`, or a non-list value is a hard error naming the entry.
 - The copied paths are disclosed on stderr before the container starts and
   recorded as `seeded` in `run.json`. An empty list copies nothing.
+
+### R-24 Plugin mirroring
+- With `mirror_plugins` true (the default), every `run` and `enter` copies the
+  host's `~/.claude/plugins/installed_plugins.json` and
+  `known_marketplaces.json` into the agent home's `plugins/`, merges the
+  host `settings.json` `enabledPlugins` map into the sandbox `settings.json`,
+  and mounts read-only, each at its host path, the plugin cache, the
+  marketplaces directory, and any registry target outside them. The absolute
+  paths in the registries therefore resolve unchanged inside the container.
+  Registries are copied, never mounted, so sandbox plugin state never writes
+  to the host. A registry target that no longer exists is skipped.
+- The container also gets the host uv cache at `/root/.cache/uv`, alongside
+  the npm, pnpm and pip caches, and the image carries AWS CLI v2.
 
 ## Deferred (must NOT be built now)
 

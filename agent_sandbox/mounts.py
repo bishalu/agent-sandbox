@@ -100,6 +100,9 @@ def plan_for(workspace, cfg, home=None):
                 engine = f"{m.container}/templates/adws"
                 if (pathlib.Path(m.host) / "templates" / "adws").is_dir():
                     plan.env["SSSF_HOME"] = engine
+        # The host's Claude Code plugins, read-only at their host paths (R-24).
+        from . import plugins
+        plan.mounts += plugins.mounts(cfg)
     if workspace.kind == "worktree":
         common, warning = gitdir.check(workspace.repo)
         if warning:
@@ -144,15 +147,26 @@ def skill_mounts(cfg):
                 f"skill_mounts entry is not a directory: {entry} (resolves to {real})",
                 "Fix the path in ~/agent-sandbox/config.json or remove the entry.",
             )
-        name = src.name
-        if name in seen:
-            raise MountError(
-                f"two skill_mounts entries share the name {name!r}: {seen[name]} and {entry}",
-                "Skills mount by basename; rename or drop one of them.",
-            )
-        seen[name] = entry
-        out.append(Mount(real, f"{CONTAINER_HOME}/.claude/skills/{name}",
-                         read_only=True, purpose="skill"))
+        # A directory *of* skills (no SKILL.md of its own, children that have
+        # one) expands to one mount per child, so "~/.claude/skills" mirrors
+        # the host's whole skill set. Each child is symlink-resolved on its
+        # own, because a host skills directory is usually a set of symlinks
+        # into a checkout elsewhere, and the container cannot follow them.
+        if not (real / "SKILL.md").is_file() and any(
+                (c / "SKILL.md").is_file() for c in real.iterdir() if c.is_dir()):
+            children = [(c.name, c) for c in sorted(src.iterdir())
+                        if c.is_dir() and (c.resolve() / "SKILL.md").is_file()]
+        else:
+            children = [(src.name, src)]
+        for name, child in children:
+            if name in seen:
+                raise MountError(
+                    f"two skill_mounts entries share the name {name!r}: {seen[name]} and {child}",
+                    "Skills mount by basename; rename or drop one of them.",
+                )
+            seen[name] = str(child)
+            out.append(Mount(child.resolve(), f"{CONTAINER_HOME}/.claude/skills/{name}",
+                             read_only=True, purpose="skill"))
     return out
 
 

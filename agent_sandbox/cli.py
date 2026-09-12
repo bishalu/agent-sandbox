@@ -11,7 +11,7 @@ import os
 import pathlib
 import sys
 
-from . import (agent_home, cleanup, config, credentials, doctor, gitdir,
+from . import (agent_home, cleanup, config, credentials, doctor, gitdir, plugins,
                image, mounts, resources, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
@@ -176,6 +176,7 @@ def cmd_run(args, command):
         image.ensure(img, quiet=bool(args.json))
 
         home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=bool(args.json))
+        mirrored = plugins.sync(home, cfg)
         creds = credentials.resolve(
             sandbox_dir=config.RUNS / ws.sandbox_id,
             with_github=args.with_github_auth,
@@ -212,6 +213,8 @@ def cmd_run(args, command):
                         f"(gitignored copies from {ws.repo})")
             for w in seed_warnings:
                 _eprint(f"{PROG}: warning: {w}")
+            if mirrored:
+                _eprint(f"[{PROG}] plugins: {len(mirrored)} mirrored from the host, read-only")
             _describe_plan(plan)
 
         spec = SandboxSpec(
@@ -280,9 +283,16 @@ def cmd_enter(args, command):
     backend.preflight()
     image.ensure(img, quiet=bool(args.json))
 
+    # Gitignored secrets are refreshed from the source checkout on every
+    # start, so a key rotated on the host reaches a resumed sandbox (R-23).
+    seeded, seed_warnings = worktree.seed(
+        ws, config.resolve("worktree_seed", None, cfg))
+    rec.update(seeded=seeded).save()
+
     # Same helper as `run`: an existing home is never re-seeded, only
-    # checked against the current image (R-18).
+    # checked against the current image (R-18). Plugins are re-mirrored.
     home = agent_home.ensure(args.sandbox_id, cfg, img, quiet=bool(args.json))
+    mirrored = plugins.sync(home, cfg)
     creds = credentials.resolve(
         sandbox_dir=config.RUNS / args.sandbox_id,
         with_github=args.with_github_auth,
@@ -298,6 +308,13 @@ def cmd_enter(args, command):
 
     if not args.json:
         _eprint(f"[{PROG}] re-entering {args.sandbox_id} → {ws.path}")
+        if seeded:
+            _eprint(f"[{PROG}] seeded: {', '.join(seeded)} "
+                    f"(gitignored copies refreshed from {ws.repo})")
+        for w in seed_warnings:
+            _eprint(f"{PROG}: warning: {w}")
+        if mirrored:
+            _eprint(f"[{PROG}] plugins: {len(mirrored)} mirrored from the host, read-only")
         _describe_plan(plan)
 
     spec = SandboxSpec(
