@@ -592,7 +592,8 @@ def cmd_admission(args):
         # are visible before a host turns it on.
         live = dataclasses.replace(settings, enabled=True)
         d = admission.decide(res.memory_bytes, committed, avail, fresh, None, live,
-                             request_source=res.memory_source)
+                             request_source=res.memory_source,
+                             disk_free=admission.read_disk_free(live))
         state = admission.read_state()
         if args.json:
             print(json.dumps({"enabled": settings.enabled, "sources": settings.sources,
