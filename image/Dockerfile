@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ripgrep fd-find \
         unzip zip tar gzip bzip2 xz-utils \
         less nano vim-tiny procps psmisc file openssh-client \
-        sudo tini just sqlite3 \
+        sudo tini just sqlite3 ffmpeg \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
     && rm -rf /var/lib/apt/lists/*
 
