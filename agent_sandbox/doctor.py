@@ -16,8 +16,8 @@ import subprocess
 import tempfile
 import time
 
-from . import (agent_home, cleanup, config, credentials, image, memlog, mounts,
-               resources, worktree)
+from . import (admission, agent_home, cleanup, config, credentials, image, locks,
+               memlog, mounts, resources, state, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
 from .errors import SandboxError
@@ -292,8 +292,12 @@ def run_checks(quick=False, with_quota=False):
         checks.append(Check("worktree sandbox probe", WARN, "skipped: image not built",
                             "Run `agent-sandbox build` first."))
     if quick or need:
-        # The thread-env check reads the probe's output; no probe, no reading.
+        # The thread-env and slice-cgroup checks read the probe's output; no
+        # probe, no reading.
         checks.append(thread_env_check(None, resources.ResourceConfig(cfg=cfg).thread_env()))
+        settings = _settings_or_none(cfg)
+        if settings is not None:
+            checks.append(slice_cgroup_check(None, settings))
     checks += _drift_checks()
     return checks
 
@@ -365,6 +369,15 @@ def _host_checks(cfg):
         f"agent-sandbox memlog install   (enables {memlog.TIMER}; a sample lands within a minute)\n"
         f"     Launches refuse admission until the newest line of {memlog.LOG} is fresh.",
     ))
+
+    # --- admission (U7): config coherent, records honest, locks live, slice capped ---
+    checks.append(admission_config_check(cfg, admission.read_state()))
+    checks.append(stale_running_live(cfg))
+    checks.append(project_locks_check(config.LOCK_DIR))
+    settings = _settings_or_none(cfg)
+    if settings is not None:
+        checks.append(slice_memory_max_check(settings, read_slice_memory_max(),
+                                             slice_cgroup_dir().exists()))
 
     # --- disk guard (KTD11): the host drive floor and, under WSL, a sparse vhdx ---
     checks.append(host_disk_check(cfg))
@@ -487,6 +500,275 @@ def vhdx_sparse_check(cfg, run=fsutil_sparse_queryflag, find=vhdx_candidates):
     return Check("vhdx sparse", PASS, detail)
 
 
+
+# ---------------------------------------------------------------- admission (U7)
+SLICE = resources.ResourceConfig.SLICE
+INSTALL_REMEDY = ("agent-sandbox admission install   (sets MemoryMax on "
+                  f"{SLICE} to the budget and records it)")
+# KTD8: if rootless Docker refuses a user-manager slice as cgroup parent, the
+# budget is held by the whole user service instead, and the owner sets that.
+SLICE_FALLBACK = (
+    f"Rootless Docker did not place the container in {SLICE}, so the slice's MemoryMax\n"
+    "     does not bound the sandboxes. The KTD8 fallback is MemoryMax on the whole user\n"
+    "     service, set by the owner:\n"
+    f"     sudo systemctl set-property user@{os.getuid()}.service MemoryMax=<budget>\n"
+    "     Then the budget bounds everything this user runs, not only sandboxes.")
+
+
+def _settings_or_none(cfg):
+    """The admission settings, or None when they do not parse; the admission
+    config row reports why, so the other rows do not repeat it."""
+    try:
+        return admission.resolve_settings(cfg)
+    except SandboxError:
+        return None
+
+
+def probe_backend():
+    """The sandbox probe's backend bypasses admission the way `--force` does
+    (KTD9): a stale memory log or a full disk is the memlog or host disk
+    row's finding, never a failed probe."""
+    return LocalDockerBackend(force_admission=True)
+
+
+def admission_config_check(cfg, slice_state=None):
+    """The admission_* keys parse and cohere, and when admission is on, the
+    slice cap `admission install` recorded matches the budget. `slice_state`
+    is `admission.read_state()`: None when nothing was recorded."""
+    name = "admission config"
+    keys_remedy = ("Check the admission_* keys in config.json and any "
+                   "AGENT_SANDBOX_ADMISSION_* variables.")
+    try:
+        s = admission.resolve_settings(cfg)
+    except SandboxError as e:
+        return Check(name, FAIL, e.message, f"{keys_remedy} {e.remedy or ''}".strip())
+    src = s.sources
+    summary = (f"budget={admission.fmt(s.budget)} ({src['budget']}) "
+               f"floor={admission.fmt(s.floor)} ({src['floor']}) "
+               f"disk_floor={admission.fmt(s.disk_floor)} ({src['disk_floor']}) "
+               f"wait={s.wait_interval_s:g}/{s.wait_timeout_s:g}s "
+               f"memlog_max_age={s.memlog_max_age_s:g}s")
+    problems = []
+    if s.budget <= 0:
+        problems.append(f"budget {admission.fmt(s.budget)} is not above 0")
+    if s.floor < 0:
+        problems.append(f"floor {s.floor / G:g}g is below 0")
+    if s.disk_floor < 0:
+        problems.append(f"disk floor {s.disk_floor / G:g}g is below 0")
+    if s.wait_interval_s <= 0:
+        problems.append(f"wait interval {s.wait_interval_s:g}s is not above 0")
+    if s.wait_interval_s >= s.wait_timeout_s:
+        problems.append(f"wait interval {s.wait_interval_s:g}s is not below the wait "
+                        f"timeout {s.wait_timeout_s:g}s")
+    if problems:
+        return Check(name, FAIL, "; ".join(problems) + f" ({summary})", keys_remedy)
+    if not s.enabled:
+        return Check(name, PASS, f"disabled ({src['enabled']}); {summary}")
+    if slice_state is None:
+        return Check(name, WARN, f"enabled ({src['enabled']}); {summary}; "
+                                 f"no slice cap recorded in {admission.state_file()}",
+                     INSTALL_REMEDY)
+    if not slice_state.get("ok", False):
+        return Check(name, FAIL, f"enabled; {summary}; the last `admission install` failed: "
+                                 f"{slice_state.get('output') or '?'}", INSTALL_REMEDY)
+    recorded = int(slice_state.get("memory_max") or 0)
+    if recorded != s.budget:
+        return Check(name, FAIL,
+                     f"enabled; {summary}; recorded slice MemoryMax={admission.fmt(recorded)} "
+                     f"differs from budget {admission.fmt(s.budget)}", INSTALL_REMEDY)
+    return Check(name, PASS, f"enabled ({src['enabled']}); {summary}; slice "
+                             f"MemoryMax={admission.fmt(recorded)} recorded "
+                             f"{slice_state.get('set_at', '?')}")
+
+
+def stale_running_check(records, container_exists, pid_alive,
+                        wait_timeout_s=state.DEFAULT_WAIT_TIMEOUT_S,
+                        wait_interval_s=state.DEFAULT_WAIT_INTERVAL_S):
+    """No run.json entry says running (or waiting) while its container is
+    gone. `state.derive_record` over every record with the injected probes;
+    entries it would correct to crashed are the finding."""
+    name = "stale running entries"
+    stale, orphaned = [], []
+    for rec in records:
+        d = state.derive_record(rec, container_exists, pid_alive,
+                                wait_timeout_s=wait_timeout_s, wait_interval_s=wait_interval_s)
+        crashed = [e for _, e in d.changes if e.corrected == "crashed"]
+        gone = [e for _, e in d.changes if e.corrected == "orphaned"]
+        if crashed:
+            stale.append(f"{rec.sandbox_id}: {len(crashed)} "
+                         f"{'entry says' if len(crashed) == 1 else 'entries say'} "
+                         f"{'/'.join(sorted({e.recorded for e in crashed}))}, "
+                         f"container{'s' if len(crashed) > 1 else ''} gone")
+        if gone:
+            orphaned.append(f"{rec.sandbox_id}: {len(gone)} orphaned "
+                            f"(container up, launcher gone)")
+    if stale:
+        return Check(name, FAIL, "; ".join(stale),
+                     "agent-sandbox status --reconcile   (marks them crashed through the "
+                     "re-read guard; the driver's resume finishes what they left)")
+    if orphaned:
+        return Check(name, WARN, "; ".join(orphaned),
+                     "agent-sandbox status --reconcile   (records them as orphaned; the "
+                     "container keeps running without its launcher)")
+    n = len(list(records))
+    return Check(name, PASS, f"{n} record{'s' if n != 1 else ''}, every running entry "
+                             "has its container")
+
+
+def stale_running_live(cfg):
+    """`stale_running_check` over the host's records with the real probes:
+    one `docker ps -a` over our label and os.kill(pid, 0)."""
+    try:
+        names = {row["name"] for row in LocalDockerBackend().list_containers()}
+    except Exception as e:  # doctor keeps going; the daemon rows say what is wrong
+        return Check("stale running entries", WARN, f"could not list containers: {e}")
+    s = _settings_or_none(cfg)
+    kw = {}
+    if s is not None:
+        kw = dict(wait_timeout_s=s.wait_timeout_s, wait_interval_s=s.wait_interval_s)
+    return stale_running_check(RunRecord.all(), names.__contains__, state.pid_alive, **kw)
+
+
+def project_locks_check(lock_dir, pid_alive=state.pid_alive):
+    """No lock file under LOCK_DIR is held by a dead pid. The admission flock
+    carries no pid and is skipped; a file without a pid is unreadable, not
+    dead. The PidLock rule: a dead holder is reclaimed by the next taker."""
+    name = "project locks"
+    lock_dir = pathlib.Path(lock_dir)
+    files = sorted(p for p in lock_dir.glob("*.lock")
+                   if p.name != admission.ADMISSION_LOCK) if lock_dir.is_dir() else []
+    if not files:
+        return Check(name, PASS, f"no lock files under {lock_dir}")
+    dead, live, unreadable = [], [], []
+    for path in files:
+        h = locks.PidLock(path).holder()
+        if h is None:
+            unreadable.append(path.name)
+            continue
+        pid, note = h
+        if pid_alive(pid) is False:
+            dead.append(f"{path.name} (pid {pid} dead; {note})")
+        else:
+            live.append(f"{path.name} (pid {pid} {note})")
+    if dead:
+        return Check(name, FAIL, "; ".join(dead),
+                     "The next launch for that project reclaims a dead holder's lock on its "
+                     "own; to clear it now:\n     rm "
+                     + " ".join(str(lock_dir / d.split(" ")[0]) for d in dead))
+    if unreadable:
+        return Check(name, WARN, "unreadable (no pid inside): " + ", ".join(unreadable),
+                     "A lock without a pid is reclaimed by the next taker; delete it if it "
+                     "is not a lock at all.")
+    return Check(name, PASS, "held by live processes: " + "; ".join(live))
+
+
+_MEMORY_MAX = re.compile(r"MemoryMax=(\S+)")
+
+
+def parse_memory_max(text):
+    """Bytes from `systemctl show -p MemoryMax`; None for infinity, no
+    line, or no text."""
+    m = _MEMORY_MAX.search(text or "")
+    if not m or not m.group(1).isdigit():
+        return None
+    return int(m.group(1))
+
+
+def slice_cgroup_dir(uid=None):
+    """Where the user manager keeps the slice's cgroup; absent until the
+    first unit is placed in it."""
+    uid = os.getuid() if uid is None else uid
+    return (pathlib.Path("/sys/fs/cgroup/user.slice") / f"user-{uid}.slice"
+            / f"user@{uid}.service" / SLICE)
+
+
+def read_slice_memory_max():
+    p = _sh(["systemctl", "--user", "show", SLICE, "-p", "MemoryMax"])
+    return p.stdout if p and p.returncode == 0 else None
+
+
+def slice_memory_max_check(settings, show_output, cgroup_exists):
+    """When admission is on, the slice's MemoryMax equals the budget (KTD8).
+    `show_output` is `systemctl --user show agent-sandbox.slice -p
+    MemoryMax` (None when systemctl could not answer); `cgroup_exists` is
+    whether the slice's cgroup directory is there, which it is not until
+    something has run in the slice."""
+    name = "slice memory.max"
+    if not settings.enabled:
+        return Check(name, PASS, f"admission disabled; {SLICE} is not required")
+    if show_output is None:
+        return Check(name, WARN, f"systemctl --user show {SLICE} gave no answer",
+                     "Check `systemctl --user is-system-running`, then " + INSTALL_REMEDY)
+    got = parse_memory_max(show_output)
+    budget = settings.budget
+    if got == budget:
+        return Check(name, PASS, f"{SLICE} MemoryMax={admission.fmt(got)} = budget"
+                                 + ("" if cgroup_exists else " (slice not started yet)"))
+    m = _MEMORY_MAX.search(show_output)
+    shown = (admission.fmt(got) if got is not None else (m.group(1) if m else "unset"))
+    if not cgroup_exists:
+        return Check(name, WARN,
+                     f"{SLICE} MemoryMax={shown} (budget {admission.fmt(budget)}); nothing "
+                     "has run in the slice yet, so no cgroup to read", INSTALL_REMEDY)
+    return Check(name, FAIL,
+                 f"{SLICE} MemoryMax={shown} differs from budget {admission.fmt(budget)}",
+                 INSTALL_REMEDY)
+
+
+_CGROUP_LINE = re.compile(r"^CGROUP=(.*)$", re.M)
+
+
+def slice_cgroup_check(probe_output, settings, slice_cgroup_exists=None):
+    """The probe container ran inside agent-sandbox.slice (KTD8).
+
+    Reads the `CGROUP=` line the sandbox probe echoes from /proc/self/cgroup
+    rather than starting a container of its own; None means the probe did
+    not run. A private cgroup namespace (Docker's default on cgroup v2)
+    shows the container `0::/`, so then `slice_cgroup_exists`, read on the
+    host right after the probe, decides.
+    """
+    name = "slice cgroup parent"
+    if probe_output is None:
+        return Check(name, WARN, "probe not run",
+                     "Run `agent-sandbox doctor` without --quick, after `agent-sandbox build`.")
+    if not settings.enabled:
+        return Check(name, PASS, f"admission disabled; containers are not placed in {SLICE}")
+    m = _CGROUP_LINE.search(probe_output)
+    if not m:
+        return Check(name, FAIL,
+                     "the probe printed no CGROUP line; a daemon that refuses "
+                     f"--cgroup-parent={SLICE} does not start the container at all",
+                     SLICE_FALLBACK)
+    path = m.group(1).strip()
+    if SLICE in path:
+        return Check(name, PASS, f"probe container ran in {path}")
+    if re.fullmatch(r"0::/\s*", path):
+        if slice_cgroup_exists:
+            return Check(name, PASS,
+                         f"the container's cgroup namespace hides its path ({path}); "
+                         f"{slice_cgroup_dir()} exists on the host after the probe ran")
+        return Check(name, FAIL,
+                     f"the container's cgroup namespace hides its path ({path}) and "
+                     f"{slice_cgroup_dir()} is absent on the host after the probe ran",
+                     SLICE_FALLBACK)
+    return Check(name, FAIL, f"probe container ran in {path}, outside {SLICE}", SLICE_FALLBACK)
+
+
+PROBE_SCRIPT = (
+    "echo x > probe && git add probe && git commit -qm probe && echo COMMIT_OK;"
+    " C=$(git rev-parse --path-format=absolute --git-common-dir);"
+    " (touch \"$C/hooks/doctor\" 2>/dev/null && echo HOOK_WRITABLE) || echo HOOK_RO;"
+    " git worktree prune && echo PRUNE_OK;"
+    " echo BRIDGE_TEMPLATE=$(PI_CODING_AGENT_DIR=/opt/agent-sandbox/pi-agent-template pi --list-models 2>/dev/null | grep -c claude-bridge);"
+    " echo BRIDGE_HOME=$(pi --list-models 2>/dev/null | grep -c claude-bridge);"
+    " mkdir -p /tmp/nocreds && G=$(CLAUDE_CONFIG_DIR=/tmp/nocreds claude -p hi --dangerously-skip-permissions 2>&1 | head -c 400);"
+    " case \"$G\" in *'cannot be used with root'*) echo GATE_CLOSED;; *'ot logged in'*|*'login'*|*'Login'*) echo GATE_OPEN;; *) echo \"GATE_UNKNOWN: $G\";; esac;"
+    " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN;"
+    " echo THREADS=$OMP_NUM_THREADS,$OPENBLAS_NUM_THREADS,$MKL_NUM_THREADS,$AGENT_SANDBOX_THREADS;"
+    " echo CGROUP=$(tr '\\n' ' ' < /proc/self/cgroup)"
+)
+
+
 def _sandbox_probe(cfg, with_quota=False):
     """One throwaway repo, two containers: commit, overlays, bridge, gate, persistence."""
     checks = []
@@ -499,7 +781,7 @@ def _sandbox_probe(cfg, with_quota=False):
         creds = credentials.resolve(sandbox_dir=config.RUNS / ws.sandbox_id, agent_home=home)
         res = resources.ResourceConfig("1", "1g", "256", "5m", cfg)
         plan = mounts.plan_for(ws, cfg, home, resources=res)
-        backend = LocalDockerBackend()
+        backend = probe_backend()
 
         def run(cmd):
             rec = RunRecord.load(ws.sandbox_id) or RunRecord(ws.sandbox_id)
@@ -510,20 +792,11 @@ def _sandbox_probe(cfg, with_quota=False):
             out = rec.stdout_log.read_text() if rec.stdout_log.exists() else ""
             return r, redact(out)
 
-        script1 = (
-            "echo x > probe && git add probe && git commit -qm probe && echo COMMIT_OK;"
-            " C=$(git rev-parse --path-format=absolute --git-common-dir);"
-            " (touch \"$C/hooks/doctor\" 2>/dev/null && echo HOOK_WRITABLE) || echo HOOK_RO;"
-            " git worktree prune && echo PRUNE_OK;"
-            " echo BRIDGE_TEMPLATE=$(PI_CODING_AGENT_DIR=/opt/agent-sandbox/pi-agent-template pi --list-models 2>/dev/null | grep -c claude-bridge);"
-            " echo BRIDGE_HOME=$(pi --list-models 2>/dev/null | grep -c claude-bridge);"
-            " mkdir -p /tmp/nocreds && G=$(CLAUDE_CONFIG_DIR=/tmp/nocreds claude -p hi --dangerously-skip-permissions 2>&1 | head -c 400);"
-            " case \"$G\" in *'cannot be used with root'*) echo GATE_CLOSED;; *'ot logged in'*|*'login'*|*'Login'*) echo GATE_OPEN;; *) echo \"GATE_UNKNOWN: $G\";; esac;"
-            " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN;"
-            " echo THREADS=$OMP_NUM_THREADS,$OPENBLAS_NUM_THREADS,$MKL_NUM_THREADS,$AGENT_SANDBOX_THREADS"
-        )
-        r1, out1 = run(script1)
+        r1, out1 = run(PROBE_SCRIPT)
         checks.append(thread_env_check(out1, res.thread_env()))
+        settings = _settings_or_none(cfg)
+        if settings is not None:
+            checks.append(slice_cgroup_check(out1, settings, slice_cgroup_dir().exists()))
         ok = r1.status == "completed" and "COMMIT_OK" in out1
         on_host = subprocess.run(["git", "-C", str(ws.path), "log", "--oneline"],
                                  capture_output=True, text=True).stdout.count("\n")
