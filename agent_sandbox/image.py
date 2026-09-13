@@ -66,6 +66,36 @@ def needs_build(image=None):
     return False, "up to date"
 
 
+def _running(rows):
+    """`docker ps -a` rows whose status says the container is up (paused counts)."""
+    return [r for r in rows if str(r.get("status", "")).startswith("Up")]
+
+
+def refuse_build_while_running(list_containers=None, force=False):
+    """Refuse an image build while any managed container runs (R10, KTD7).
+
+    One helper for both build paths: `cmd_build` calls it before `build()`,
+    `ensure()` before a fingerprint-triggered rebuild. A build beside a
+    running sandbox competes with it for memory and disk on a host that has
+    already been taken down by exactly that. `list_containers` is injected
+    for tests; the default asks the local daemon. Returns the running rows so
+    a forced caller can say what it built beside.
+    """
+    if list_containers is None:
+        from .docker_backend import LocalDockerBackend
+        list_containers = LocalDockerBackend().list_containers
+    running = _running(list_containers() or [])
+    if running and not force:
+        names = ", ".join(r.get("name") or r.get("id", "?") for r in running)
+        raise ImageError(
+            f"refusing to build the image while {len(running)} managed "
+            f"container{'s' if len(running) != 1 else ''} run{'s' if len(running) == 1 else ''}: {names}",
+            "Build when idle (wait for the sandbox to finish or stop it), or pass "
+            "--force-build to build beside it.",
+        )
+    return running
+
+
 def build(image=None, no_cache=False, quiet=False, stream=True):
     """Build the base image. Returns True on success."""
     image = image or config.IMAGE_NAME
@@ -103,11 +133,17 @@ def build(image=None, no_cache=False, quiet=False, stream=True):
     return True
 
 
-def ensure(image=None, quiet=False):
-    """Auto-build transparently on first use (R-11)."""
+def ensure(image=None, quiet=False, *, list_containers=None, force=False):
+    """Auto-build transparently on first use (R-11), unless a sandbox runs.
+
+    A stale fingerprint on a launch used to rebuild beside whatever was
+    running; now it fails fast through `refuse_build_while_running` with the
+    remedy, and `force` (the CLI's --force-build) is the way past (KTD7).
+    """
     image = image or config.IMAGE_NAME
     need, why = needs_build(image)
     if need:
+        refuse_build_while_running(list_containers, force)
         if not quiet:
             print(f"[agent-sandbox] {why}", file=sys.stderr, flush=True)
         build(image, quiet=quiet)

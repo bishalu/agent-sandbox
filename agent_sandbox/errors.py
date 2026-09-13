@@ -26,7 +26,9 @@ class RootfulDockerRefused(SandboxError):
 
 
 class ImageError(SandboxError):
-    pass
+    """The base image cannot be built or found: a missing Dockerfile, a failed
+    `docker build`, or a build refused while a managed container runs (R10);
+    the remedy for that last one is to build when idle or pass --force-build."""
 
 
 class RepoError(SandboxError):

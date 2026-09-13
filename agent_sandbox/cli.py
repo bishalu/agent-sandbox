@@ -205,7 +205,7 @@ def cmd_run(args, command):
         rec.update(seeded=seeded).save()
 
         img = config.resolve("image", args.image, cfg)
-        image.ensure(img, quiet=bool(args.json))
+        image.ensure(img, quiet=bool(args.json), force=args.force_build)
 
         home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=bool(args.json))
         mirrored = plugins.sync(home, cfg)
@@ -215,7 +215,7 @@ def cmd_run(args, command):
             with_full_claude_state=args.with_full_claude_state,
             agent_home=home,
         )
-        plan = mounts.plan_for(ws, cfg, home)
+        plan = mounts.plan_for(ws, cfg, home, resources=res)
 
         rec.update(
             repo=ws.repo, workspace=str(ws.path), workspace_kind=ws.kind,
@@ -315,7 +315,7 @@ def cmd_enter(args, command):
     backend = LocalDockerBackend(strict_caps=args.strict_caps,
                                  force_admission=args.force, wait=args.wait)
     backend.preflight()
-    image.ensure(img, quiet=bool(args.json))
+    image.ensure(img, quiet=bool(args.json), force=args.force_build)
 
     # Gitignored secrets are refreshed from the source checkout on every
     # start, so a key rotated on the host reaches a resumed sandbox (R-23).
@@ -333,7 +333,7 @@ def cmd_enter(args, command):
         with_full_claude_state=args.with_full_claude_state,
         agent_home=home,
     )
-    plan = mounts.plan_for(ws, cfg, home)
+    plan = mounts.plan_for(ws, cfg, home, resources=res)
     rec.update(resources=res.to_dict(), credentials=creds.to_dict(),
                mode=mode, network=network, image=img, tags=tags,
                agent_home=str(home.path),
@@ -533,6 +533,8 @@ def cmd_doctor(args):
 # ---------------------------------------------------------------- build
 def cmd_build(args):
     try:
+        # KTD7: no image build beside a running sandbox, from either build path.
+        image.refuse_build_while_running(force=args.force_build)
         image.build(config.resolve("image", args.image), no_cache=args.no_cache)
     except SandboxError as e:
         return _fail(e)
@@ -720,6 +722,8 @@ def build_parser():
                         help="capability profile (default from config)")
         sp.add_argument("--cpus")
         sp.add_argument("--memory")
+        sp.add_argument("--force-build", action="store_true",
+                        help="rebuild a stale image even while a managed container runs")
         sp.add_argument("--pids-limit", dest="pids_limit")
         sp.add_argument("--timeout", help="hard wall-clock ceiling, e.g. 12h")
         sp.add_argument("--network", choices=["full", "none", "restricted"])
@@ -805,6 +809,8 @@ def build_parser():
 
     sp = sub.add_parser("build", help="build the base image")
     sp.add_argument("--no-cache", action="store_true")
+    sp.add_argument("--force-build", action="store_true",
+                    help="build even while a managed container runs")
     sp.add_argument("--image")
 
     sp = sub.add_parser("config", help="show or set persistent defaults")

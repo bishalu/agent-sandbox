@@ -75,14 +75,21 @@ class Plan:
         self.warnings = list(warnings or [])
 
 
-def plan_for(workspace, cfg, home=None):
+def plan_for(workspace, cfg, home=None, resources=None):
     """Compose every declared mount and env var for one container (R-16).
 
     One planner for both entry points, so `enter` reproduces exactly what
     `run` mounted, re-deriving the git set from the host each time. Order is
     disclosure order only; Docker sorts by destination when mounting.
+
+    `resources` is the run's ResourceConfig; its thread caps (KTD6) land in
+    the env here so every backend gets them. Callers that resolved limits
+    from flags pass theirs; otherwise the config's limits decide.
     """
     from . import gitdir                      # gitdir imports Mount from here
+    from . import resources as _resources
+    if resources is None:
+        resources = _resources.ResourceConfig(cfg=cfg)
     plan = Plan()
     if home is not None:
         plan.mounts += home.mounts()
@@ -116,6 +123,7 @@ def plan_for(workspace, cfg, home=None):
                 f"source repository {workspace.repo} no longer resolves as a git "
                 "repository; git will not work inside this sandbox.")
     plan.env.update(git_identity_env(workspace))
+    plan.env.update(resources.thread_env())
     for m in plan.mounts:
         m.validate()
     return plan

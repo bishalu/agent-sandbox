@@ -291,6 +291,9 @@ def run_checks(quick=False, with_quota=False):
     elif need:
         checks.append(Check("worktree sandbox probe", WARN, "skipped: image not built",
                             "Run `agent-sandbox build` first."))
+    if quick or need:
+        # The thread-env check reads the probe's output; no probe, no reading.
+        checks.append(thread_env_check(None, resources.ResourceConfig(cfg=cfg).thread_env()))
     checks += _drift_checks()
     return checks
 
@@ -494,8 +497,8 @@ def _sandbox_probe(cfg, with_quota=False):
         img = config.resolve("image", None, cfg)
         home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=True)
         creds = credentials.resolve(sandbox_dir=config.RUNS / ws.sandbox_id, agent_home=home)
-        plan = mounts.plan_for(ws, cfg, home)
         res = resources.ResourceConfig("1", "1g", "256", "5m", cfg)
+        plan = mounts.plan_for(ws, cfg, home, resources=res)
         backend = LocalDockerBackend()
 
         def run(cmd):
@@ -516,9 +519,11 @@ def _sandbox_probe(cfg, with_quota=False):
             " echo BRIDGE_HOME=$(pi --list-models 2>/dev/null | grep -c claude-bridge);"
             " mkdir -p /tmp/nocreds && G=$(CLAUDE_CONFIG_DIR=/tmp/nocreds claude -p hi --dangerously-skip-permissions 2>&1 | head -c 400);"
             " case \"$G\" in *'cannot be used with root'*) echo GATE_CLOSED;; *'ot logged in'*|*'login'*|*'Login'*) echo GATE_OPEN;; *) echo \"GATE_UNKNOWN: $G\";; esac;"
-            " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN"
+            " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN;"
+            " echo THREADS=$OMP_NUM_THREADS,$OPENBLAS_NUM_THREADS,$MKL_NUM_THREADS,$AGENT_SANDBOX_THREADS"
         )
         r1, out1 = run(script1)
+        checks.append(thread_env_check(out1, res.thread_env()))
         ok = r1.status == "completed" and "COMMIT_OK" in out1
         on_host = subprocess.run(["git", "-C", str(ws.path), "log", "--oneline"],
                                  capture_output=True, text=True).stdout.count("\n")
@@ -582,6 +587,37 @@ def _sandbox_probe(cfg, with_quota=False):
                 pass
         shutil.rmtree(repo, ignore_errors=True)
     return checks
+
+
+_THREADS_LINE = re.compile(r"^THREADS=(.*)$", re.M)
+
+
+def thread_env_check(probe_output, expected):
+    """A container sees the thread caps plan_for merged into its env (R10).
+
+    Reads the `THREADS=a,b,c,d` line the sandbox probe echoes rather than
+    starting a container of its own; `expected` is the probe's
+    `ResourceConfig.thread_env()`. `None` output means the probe did not run.
+    """
+    name = "thread caps in container env"
+    want = [expected[k] for k in resources.ResourceConfig.THREAD_VARS]
+    if probe_output is None:
+        return Check(name, WARN, "probe not run",
+                     "Run `agent-sandbox doctor` without --quick, after `agent-sandbox build`.")
+    m = _THREADS_LINE.search(probe_output)
+    if not m:
+        return Check(name, FAIL, "the probe printed no THREADS line",
+                     "The probe container did not reach the env check; see the checks above.")
+    got = m.group(1).strip().split(",")
+    got += [""] * (len(want) - len(got))
+    wrong = [f"{k}={g or 'unset'} (want {w})"
+             for k, g, w in zip(resources.ResourceConfig.THREAD_VARS, got, want) if g != w]
+    if wrong:
+        return Check(name, FAIL, "; ".join(wrong),
+                     "mounts.plan_for merges ResourceConfig.thread_env() into the run env; "
+                     "a backend that drops plan.env loses these caps.")
+    return Check(name, PASS, ", ".join(f"{k}={w}" for k, w in
+                                       zip(resources.ResourceConfig.THREAD_VARS, want)))
 
 
 def _drift_checks():
