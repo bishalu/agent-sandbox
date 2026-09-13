@@ -33,8 +33,12 @@
 set -euo pipefail
 
 DRIVER="${DRIVER:-$HOME/.claude/skills/milestone-supervisor/run-milestones.sh}"
-BUDGET="1g"
-MEMORY="768m"          # two of these exceed the budget; one fits
+# The budget is what other containers already commit (MCP servers and the like)
+# plus one gibibyte, so exactly one 768m sandbox fits and a second is refused
+# whatever else the host runs.
+committed_bytes="$(agent-sandbox admission show --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["decision"]["numbers"]["committed"]["bytes"])' 2>/dev/null || echo 0)"
+BUDGET="$(( (committed_bytes + 1024*1024*1024) / (1024*1024) ))m"
+MEMORY="768m"          # two of these exceed the free gibibyte; one fits
 LABEL="agent-sandbox.managed=true"
 
 step() { printf 'step %s: %s\n' "$1" "$2"; }
@@ -51,9 +55,9 @@ for name in ("host disk", "memlog"):
     if c is None:
         print(f"ABORT {name}: no such doctor row"); break
     if c["status"] == "FAIL":
-        print(f"ABORT {name}: {c[\"detail\"]}"); break
+        print("ABORT " + name + ": " + c["detail"]); break
 else:
-    print("OK " + "; ".join(f"{n}: {rows[n][\"detail\"]}" for n in ("host disk", "memlog")))
+    print("OK " + "; ".join(n + ": " + rows[n]["detail"] for n in ("host disk", "memlog")))
 ')"
 case "$gate" in
   OK*) step 0 "doctor gate ${gate#OK }" ;;
@@ -130,8 +134,8 @@ numbers="$(printf '%s' "$second" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 n = d["numbers"]
-print(f"budget={n[\"budget\"][\"bytes\"]} committed={n[\"committed\"][\"bytes\"]} "
-      f"reasons={\"; \".join(d[\"reasons\"])}")' 2>&1)" \
+reasons = "; ".join(d["reasons"])
+print("budget=%s committed=%s reasons=%s" % (n["budget"]["bytes"], n["committed"]["bytes"], reasons))' 2>&1)" \
   || fail 2 "refusal payload lacks budget/committed numbers: ${second:0:400}"
 step 2 "second launch refused, exit 3; $numbers"
 
