@@ -47,6 +47,12 @@ def row(name, limit):
     return {"name": name, "memory_limit": limit}
 
 
+def roomy_disks(cfg=None):
+    """Disk readings above the floor, so these tests exercise memory alone;
+    the disk guard has its own tests in test_disk_guard.py (KTD11)."""
+    return {cfg.disk_path if cfg is not None else "/mnt/c": 100 * G, "/": 40 * G}
+
+
 @pytest.fixture
 def clean_env(monkeypatch):
     for k in list(os.environ):
@@ -177,6 +183,7 @@ def _acquire(spec, cfg, rows, mem=30 * G, freshness=None, clock=None, wait=True,
         inspect_running=lambda: list(rows),
         read_mem_available=lambda: mem,
         read_memlog=lambda c: freshness or fresh(),
+        read_disk_free=roomy_disks,
         now=clock.now, sleep=clock.sleep, **kw)
 
 
@@ -234,6 +241,7 @@ def test_wait_timeout_fails_with_last_reasons_and_record_states(home):
         admission.acquire(_spec("12g", rec=rec), settings(timeout=120, interval=30),
                           quiet=True, inspect_running=lambda: [row("a", 8 * G)],
                           read_mem_available=lambda: 30 * G, read_memlog=lambda c: fresh(),
+                          read_disk_free=roomy_disks,
                           now=clock.now, sleep=sleep)
     assert seen and all(s == "waiting" and since for s, since in seen)
     assert clock.t >= 120
@@ -253,6 +261,7 @@ def test_wait_then_admit_when_headroom_appears(home):
     h = admission.acquire(_spec("12g"), settings(interval=30), quiet=True,
                           inspect_running=inspect_running,
                           read_mem_available=lambda: 30 * G, read_memlog=lambda c: fresh(),
+                          read_disk_free=roomy_disks,
                           now=clock.now, sleep=clock.sleep)
     assert h.decision.verdict == "admit" and clock.sleeps == [30, 30]
     h.release()
@@ -320,7 +329,8 @@ def test_two_launchers_serialize_on_the_flock_and_count_each_other(home):
         h = admission.acquire(_spec("8g"), cfg, quiet=True,
                               inspect_running=lambda: list(rows),
                               read_mem_available=lambda: 30 * G,
-                              read_memlog=lambda c: fresh())
+                              read_memlog=lambda c: fresh(),
+                              read_disk_free=roomy_disks)
         results["a"] = (h.decision, time.monotonic())
         h.release_when_visible("c-a", inspect_exists, timeout=30, poll=0.05)
         h.thread.join(10)
@@ -332,7 +342,8 @@ def test_two_launchers_serialize_on_the_flock_and_count_each_other(home):
         h = admission.acquire(_spec("8g"), cfg, quiet=True,
                               inspect_running=lambda: list(rows),
                               read_mem_available=lambda: 30 * G,
-                              read_memlog=lambda c: fresh())
+                              read_memlog=lambda c: fresh(),
+                              read_disk_free=roomy_disks)
         results["b"] = (h.decision, time.monotonic())
         h.release()
 
@@ -361,7 +372,8 @@ def test_numbers_line_printed_once_on_admit(home, capsys):
     rec.add_container("c1", "runc", ["true"])
     h = admission.acquire(_spec("8g", rec=rec), settings(), quiet=False,
                           inspect_running=lambda: [], read_mem_available=lambda: 30 * G,
-                          read_memlog=lambda c: fresh())
+                          read_memlog=lambda c: fresh(),
+                          read_disk_free=roomy_disks)
     h.release()
     err = capsys.readouterr().err
     assert "admission:" in err and "budget=16g (config)" in err

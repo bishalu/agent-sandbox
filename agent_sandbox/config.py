@@ -69,6 +69,13 @@ DEFAULTS = {
     "admission_mem_floor_gb": 8,
     "admission_wait_timeout_s": 1800,
     "admission_wait_interval_s": 30,
+    # Disk guard (KTD11): a launch refuses, at once, when the host drive
+    # backing the guest or the guest root has less than this many GiB free.
+    # The 16:34 reboot was the Windows drive holding ext4.vhdx at 1.1 GB,
+    # not memory. `admission_disk_path` None means auto: /mnt/c when
+    # /proc/version names Microsoft (WSL), else /.
+    "admission_disk_floor_gb": 20,
+    "admission_disk_path": None,
     # Swap allowance per container; None means "equal to memory", so a
     # container cannot spill into the VM's swap (KTD8).
     "memory_swap": None,
@@ -88,11 +95,16 @@ _ENV = {
     "admission_mem_floor_gb": "AGENT_SANDBOX_ADMISSION_MEM_FLOOR_GB",
     "admission_wait_timeout_s": "AGENT_SANDBOX_ADMISSION_WAIT_TIMEOUT_S",
     "admission_wait_interval_s": "AGENT_SANDBOX_ADMISSION_WAIT_INTERVAL_S",
+    "admission_disk_floor_gb": "AGENT_SANDBOX_ADMISSION_DISK_FLOOR_GB",
+    "admission_disk_path": "AGENT_SANDBOX_ADMISSION_DISK_PATH",
     "memory_swap": "AGENT_SANDBOX_MEMORY_SWAP",
 }
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off", ""}
+
+PROC_VERSION = pathlib.Path("/proc/version")
+WSL_HOST_DISK = "/mnt/c"
 
 
 def ensure_dirs():
@@ -137,6 +149,33 @@ def resolve_source(key, flag_value=None, config=None):
 def resolve(key, flag_value=None, config=None):
     """flag > env > config.json > built-in default."""
     return resolve_source(key, flag_value, config)[0]
+
+
+def read_proc_version():
+    try:
+        return PROC_VERSION.read_text()
+    except OSError:
+        return ""
+
+
+def host_disk_path(cfg=None, read_version=None):
+    """The host drive backing the guest, for the disk guard (KTD11).
+
+    `admission_disk_path` when set (flag > env > config); otherwise auto:
+    /mnt/c when /proc/version names Microsoft, because under WSL the guest
+    root is a file (ext4.vhdx) on the Windows drive and that drive filling
+    is what kills the VM; / anywhere else.
+    """
+    return host_disk_path_source(cfg, read_version)[0]
+
+
+def host_disk_path_source(cfg=None, read_version=None):
+    """(path, tier) with tier "auto" when the path was derived, not set."""
+    path, tier = resolve_source("admission_disk_path", None, cfg)
+    if path:
+        return str(path), tier
+    version = (read_version or read_proc_version)()
+    return (WSL_HOST_DISK if "microsoft" in version.lower() else "/"), "auto"
 
 
 def as_bool(value):

@@ -5,6 +5,7 @@ trivial container, because `docker info` succeeding does not prove the
 runtime can start one.
 """
 
+import glob
 import json
 import os
 import pathlib
@@ -23,6 +24,16 @@ from .errors import SandboxError
 from .metadata import RunRecord
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+
+G = 1024 ** 3
+
+# The disk guard's WSL half (KTD11): the distro's root is a file on the
+# Windows drive; when it is not sparse, freed guest blocks never return to
+# Windows and the drive fills until a write burst kills the VM.
+CMD_EXE = pathlib.Path("/mnt/c/Windows/System32/cmd.exe")
+VHDX_GLOB = "/mnt/c/Users/*/AppData/Local/wsl/*/ext4.vhdx"
+VHDX_REMEDY = ("wsl --shutdown; wsl --manage <Distro> --set-sparse true; "
+               "then fstrim -v / as root (wsl.exe -u root -- fstrim -v /)")
 
 # Doctor output lands in evidence files; never let a value that looks like a
 # secret through, whatever a probe printed (R-22).
@@ -352,6 +363,11 @@ def _host_checks(cfg):
         f"     Launches refuse admission until the newest line of {memlog.LOG} is fresh.",
     ))
 
+    # --- disk guard (KTD11): the host drive floor and, under WSL, a sparse vhdx ---
+    checks.append(host_disk_check(cfg))
+    if "microsoft" in platform.uname().release.lower():
+        checks.append(vhdx_sparse_check(cfg))
+
     # --- credential expiry (R-18, D18): only the expiry field is read ---
     f = credentials.CREDENTIALS_FILE
     if f.exists():
@@ -372,6 +388,100 @@ def _host_checks(cfg):
                 "     README on CLAUDE_CODE_OAUTH_TOKEN if refresh proves unreliable.",
             ))
     return checks
+
+
+# ---------------------------------------------------------------- disk guard (KTD11)
+def host_disk_check(cfg, read_disk_free=memlog.disk_free):
+    """The host drive backing the guest has the admission floor free. A
+    launch refuses below it, so this is a FAIL, not a warning."""
+    path = config.host_disk_path(cfg)
+    floor_gb = float(config.resolve("admission_disk_floor_gb", None, cfg))
+    free = read_disk_free([path]).get(path)
+    remedy = (
+        f"Free space on {path}, the drive that holds this distro's ext4.vhdx under WSL:\n"
+        "     empty the Windows recycle bin and Downloads, `agent-sandbox clean --docker`\n"
+        "     (dangling images and build cache), `agent-sandbox clean` (old sandboxes).\n"
+        "     Freed guest blocks only reach Windows when the vhdx is sparse; as owner:\n"
+        f"     {VHDX_REMEDY}\n"
+        f"     Launches refuse admission while {path} is below {floor_gb:g} GiB.")
+    if free is None:
+        return Check("host disk", FAIL, f"{path}: free space unreadable (floor {floor_gb:g} GiB)",
+                     remedy)
+    ok = free / G >= floor_gb
+    return Check("host disk", PASS if ok else FAIL,
+                 f"{path}: {free / G:.1f} GiB free (floor {floor_gb:g} GiB)",
+                 "" if ok else remedy)
+
+
+def windows_path(path):
+    """/mnt/<drive>/... as the Windows path fsutil wants; anything else unchanged."""
+    m = re.match(r"^/mnt/([a-zA-Z])(/.*)?$", str(path))
+    if not m:
+        return str(path)
+    rest = (m.group(2) or "").replace("/", "\\")
+    return f"{m.group(1).upper()}:{rest}"
+
+
+def fsutil_sparse_queryflag(path, cmd_exe=CMD_EXE, run=subprocess.run):
+    """`fsutil sparse queryflag` through cmd.exe interop; None when cmd.exe
+    is not there (not WSL, or interop off). The text is returned raw."""
+    cmd_exe = pathlib.Path(cmd_exe)
+    if not cmd_exe.exists():
+        return None
+    try:
+        p = run([str(cmd_exe), "/c", "fsutil", "sparse", "queryflag", windows_path(path)],
+                capture_output=True, timeout=30)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    out = (p.stdout or b"") + (p.stderr or b"")
+    return out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+
+
+def vhdx_candidates(cfg, glob_paths=glob.glob):
+    """`admission_vhdx_path` when set, then every distro's ext4.vhdx under
+    the Windows profiles."""
+    found = []
+    configured = config.resolve("admission_vhdx_path", None, cfg)
+    if configured:
+        found.append(str(configured))
+    for p in sorted(glob_paths(VHDX_GLOB)):
+        if p not in found:
+            found.append(p)
+    return found
+
+
+def vhdx_sparse_check(cfg, run=fsutil_sparse_queryflag, find=vhdx_candidates):
+    """Under WSL, every distro vhdx is sparse. A file that cannot be found or
+    cmd.exe missing is a WARN: the check could not run, which is not the
+    same as the disk being at risk."""
+    paths = find(cfg)
+    if not paths:
+        return Check("vhdx sparse", WARN, f"no ext4.vhdx found under {VHDX_GLOB}",
+                     "Set admission_vhdx_path in config.json to the distro's ext4.vhdx "
+                     "so doctor can check it.")
+    results, bad, unknown = [], [], []
+    for path in paths:
+        out = run(path)
+        if out is None:
+            return Check("vhdx sparse", WARN, f"{CMD_EXE} not available; cannot query {path}",
+                         "Windows interop is off or this is not WSL; check by hand: "
+                         "fsutil sparse queryflag <vhdx> in an elevated prompt.")
+        text = " ".join(out.replace("\x00", "").replace("\r", "").split())
+        if "NOT set as sparse" in text:
+            bad.append(path)
+            results.append(f"{path}: NOT set as sparse")
+        elif "is set as sparse" in text:
+            results.append(f"{path}: sparse")
+        else:
+            unknown.append(path)
+            results.append(f"{path}: unrecognised fsutil output: {text[:120]}")
+    detail = "; ".join(results)
+    if bad:
+        return Check("vhdx sparse", FAIL, detail, VHDX_REMEDY)
+    if unknown:
+        return Check("vhdx sparse", WARN, detail,
+                     "Check by hand: fsutil sparse queryflag <vhdx> in an elevated prompt.")
+    return Check("vhdx sparse", PASS, detail)
 
 
 def _sandbox_probe(cfg, with_quota=False):

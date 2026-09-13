@@ -15,6 +15,11 @@ sees the new container in `docker inspect` (or thirty seconds pass), so two
 launchers cannot both pass on one stale snapshot. The per-project milestone
 lock is a second, longer lock, taken only for a run tagged `milestone` and
 released when that run returns.
+
+Disk is a refusal, never a wait (KTD11): the host drive backing the guest
+(under WSL the Windows drive holding ext4.vhdx) or the guest root below the
+disk floor, or unreadable, refuses at once, because waiting cannot free a
+disk and the 16:34 death was disk, not memory.
 """
 
 import dataclasses
@@ -38,7 +43,7 @@ G = 1024 ** 3
 
 @dataclasses.dataclass
 class Settings:
-    """The six admission keys resolved through the config ladder, with the tier
+    """The admission keys resolved through the config ladder, with the tier
     each came from so the launcher can say so (R4)."""
     enabled: bool
     budget: int              # bytes
@@ -46,6 +51,8 @@ class Settings:
     wait_timeout_s: float
     wait_interval_s: float
     memlog_max_age_s: float
+    disk_floor: int          # bytes (KTD11)
+    disk_path: str           # the host drive backing the guest
     sources: dict
 
 
@@ -63,10 +70,12 @@ def resolve_settings(cfg=None):
     cfg = config.load_config() if cfg is None else cfg
     vals, sources = {}, {}
     for key in ("enabled", "memory_budget", "mem_floor_gb", "wait_timeout_s",
-                "wait_interval_s", "memlog_max_age_s"):
+                "wait_interval_s", "memlog_max_age_s", "disk_floor_gb"):
         vals[key], sources[key] = config.resolve_source(f"admission_{key}", None, cfg)
     sources["budget"] = sources.pop("memory_budget")
     sources["floor"] = sources.pop("mem_floor_gb")
+    sources["disk_floor"] = sources.pop("disk_floor_gb")
+    disk_path, sources["disk_path"] = config.host_disk_path_source(cfg)
     try:
         return Settings(
             enabled=config.as_bool(vals["enabled"]),
@@ -75,6 +84,8 @@ def resolve_settings(cfg=None):
             wait_timeout_s=float(vals["wait_timeout_s"]),
             wait_interval_s=float(vals["wait_interval_s"]),
             memlog_max_age_s=float(vals["memlog_max_age_s"]),
+            disk_floor=int(float(vals["disk_floor_gb"]) * G),
+            disk_path=disk_path,
             sources=sources)
     except ValueError as e:
         raise SandboxError(f"bad admission setting: {e}",
@@ -109,13 +120,18 @@ def committed_memory(inspect_rows, memlog_sample, budget):
 
 
 def decide(request, committed, mem_available, memlog_sample, project_locked, cfg,
-           request_source="config"):
+           request_source="config", disk_free=None):
     """admit, wait or refuse, with reasons and the effective numbers.
 
     `memlog_sample` is the `memlog.Freshness` the launcher read; a stale one
     refuses (fail closed, KTD5). `project_locked` is None for an untagged run
     (not checked), False when the tagged run's project lock is free, or the
-    holder's pid. Refuse means waiting cannot help; wait means it might.
+    holder's pid. `disk_free` maps each path the launcher read (the host
+    drive backing the guest and the guest root) to its free bytes, None when
+    the path could not be read; any reading below the disk floor, or
+    unreadable, refuses (KTD11). None means the caller took no disk readings
+    (`admission show` reports without them). Refuse means waiting cannot
+    help; wait means it might.
     """
     if not cfg.enabled:
         return Decision("admit", [], {})
@@ -132,11 +148,21 @@ def decide(request, committed, mem_available, memlog_sample, project_locked, cfg
     if project_locked is not None:
         numbers["project_lock"] = {"held": bool(project_locked),
                                    "pid": project_locked or None, "source": "live: lock file"}
+    if disk_free is not None:
+        numbers["disk_floor"] = {"bytes": cfg.disk_floor,
+                                 "source": cfg.sources.get("disk_floor", "config")}
+        for path, free in disk_free.items():
+            numbers[f"disk_free:{path}"] = {"bytes": free, "source": "live: shutil.disk_usage"}
     refuse = []
     if not memlog_sample.fresh:
         refuse.append(f"memory log stale: {memlog_sample.reason}")
     if request > cfg.budget:
         refuse.append(f"request {fmt(request)} above the whole budget {fmt(cfg.budget)}")
+    for path, free in (disk_free or {}).items():
+        if free is None:
+            refuse.append(f"disk {path} free space unreadable (floor {fmt(cfg.disk_floor)})")
+        elif free < cfg.disk_floor:
+            refuse.append(f"disk {path} has {fmt(free)} free, below floor {fmt(cfg.disk_floor)}")
     if refuse:
         return Decision("refuse", refuse, numbers)
     wait = []
@@ -188,6 +214,12 @@ def read_mem_available():
 def read_memlog(cfg):
     return memlog.parse_last_sample(memlog.LOG, memlog.read_boot_id(),
                                     memlog.read_monotonic(), cfg.memlog_max_age_s)
+
+
+def read_disk_free(cfg):
+    """Free bytes on the host drive backing the guest and on the guest root,
+    the same reading `cleanup.disk_free_gb` takes, None where unreadable."""
+    return memlog.disk_free([cfg.disk_path, "/"])
 
 
 def state_file():
@@ -249,6 +281,13 @@ def describe(decision):
             parts.append(f"{key}={fmt(n[key]['bytes'])} ({n[key]['source']})")
     if "memlog" in n and n["memlog"].get("age_s") is not None:
         parts.append(f"memlog={n['memlog']['age_s']:.0f}s old")
+    disks = [(k[len("disk_free:"):], v["bytes"]) for k, v in n.items()
+             if k.startswith("disk_free:")]
+    if disks:
+        parts.append("disk_free=" + ",".join(
+            f"{p}:{'unreadable' if b is None else fmt(b)}" for p, b in disks))
+    if "disk_floor" in n:
+        parts.append(f"disk_floor={fmt(n['disk_floor']['bytes'])} ({n['disk_floor']['source']})")
     if "project_lock" in n:
         parts.append("project_lock=" + ("held" if n["project_lock"]["held"] else "free"))
     return " ".join(parts)
@@ -270,8 +309,8 @@ def _record(rec, decision, entry_status=None, top_status=None):
 
 def acquire(spec, cfg=None, *, force=False, wait=True, quiet=False,
             inspect_running=inspect_running, read_mem_available=read_mem_available,
-            read_memlog=read_memlog, now=time.monotonic, sleep=time.sleep,
-            lock_dir=None, out=None):
+            read_memlog=read_memlog, read_disk_free=read_disk_free,
+            now=time.monotonic, sleep=time.sleep, lock_dir=None, out=None):
     """Hold the admission flock, decide, wait if that may help, and return an
     `Admission` handle (flock still held) or None when admission does not
     apply (disabled, or `force`).
@@ -309,7 +348,7 @@ def acquire(spec, cfg=None, *, force=False, wait=True, quiet=False,
             fresh = read_memlog(cfg)
             committed = committed_memory(inspect_running(), fresh.sample, cfg.budget)
             decision = decide(request, committed, read_mem_available(), fresh, locked, cfg,
-                              request_source=request_source)
+                              request_source=request_source, disk_free=read_disk_free(cfg))
             if decision.verdict == "admit":
                 if project_lock is not None:
                     project_lock.acquire()

@@ -6,7 +6,9 @@ sample from a previous boot, or one older than it looks, apart from a fresh
 one; wall time is recorded for humans, never trusted for age. Per-container
 memory comes from each container's `memory.current` in the user's delegated
 cgroup tree because `docker stats` takes seconds on this host; it is the
-fallback only when that file is absent.
+fallback only when that file is absent. Each line also carries `disk_free`
+for the host drive backing the guest and the guest root (KTD11), so the log
+shows a disk filling up the way it shows memory going.
 
 Every reader is a parameter with a default, so the pure parts run under
 pytest without Docker or a cgroup tree (KTD9).
@@ -17,6 +19,7 @@ import datetime
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import time
 
@@ -52,6 +55,9 @@ class Sample:
     mem_available: int
     swap_free: int
     containers: dict
+    # path -> free bytes, None when the path could not be read (KTD11).
+    # Empty for lines written before the field existed.
+    disk_free: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -134,6 +140,28 @@ def parse_meminfo(text):
     return out
 
 
+def disk_free(paths, usage=shutil.disk_usage):
+    """path -> free bytes for each distinct path; None where the path cannot
+    be read, so a missing mount is a reading the guard refuses on, not a
+    silent skip (KTD11)."""
+    out = {}
+    for path in dict.fromkeys(str(p) for p in paths):
+        try:
+            out[path] = int(usage(path).free)
+        except OSError:
+            out[path] = None
+    return out
+
+
+def disk_paths(cfg=None):
+    """The host drive backing the guest, then the guest root."""
+    return list(dict.fromkeys([config.host_disk_path(cfg), "/"]))
+
+
+def read_disk_free(cfg=None):
+    return disk_free(disk_paths(cfg))
+
+
 def container_memory(containers, cgroup_root=CGROUP_ROOT, docker_stats=docker_stats):
     """name -> bytes, from cgroup files; `docker stats` once for any that lack one."""
     out, missing = {}, []
@@ -155,9 +183,10 @@ def container_memory(containers, cgroup_root=CGROUP_ROOT, docker_stats=docker_st
 def format_line(s):
     """One line, key=value, greppable; containers as name=bytes joined by commas."""
     containers = ",".join(f"{n}={b}" for n, b in s.containers.items())
+    disks = ",".join(f"{p}={'none' if b is None else b}" for p, b in s.disk_free.items())
     return (f"boot={s.boot_id} mono={s.monotonic:.3f} time={s.time} "
             f"mem_available={s.mem_available} swap_free={s.swap_free} "
-            f"containers={containers}")
+            f"containers={containers} disk_free={disks}")
 
 
 def parse_line(line):
@@ -174,9 +203,16 @@ def parse_line(line):
             for item in fields["containers"].split(","):
                 name, _, b = item.rpartition("=")
                 containers[name] = int(b)
+        disks = {}
+        # Older lines have no disk_free; they still parse (KTD11 landed later).
+        if fields.get("disk_free"):
+            for item in fields["disk_free"].split(","):
+                path, _, b = item.rpartition("=")
+                disks[path] = None if b == "none" else int(b)
         return Sample(boot_id=fields["boot"], monotonic=float(fields["mono"]),
                       time=fields["time"], mem_available=int(fields["mem_available"]),
-                      swap_free=int(fields["swap_free"]), containers=containers)
+                      swap_free=int(fields["swap_free"]), containers=containers,
+                      disk_free=disks)
     except KeyError as e:
         raise ValueError(f"missing field {e.args[0]}")
 
@@ -184,12 +220,13 @@ def parse_line(line):
 # ---------------------------------------------------------------- writing
 def sample(path=LOG, *, read_boot_id=read_boot_id, read_monotonic=read_monotonic,
            read_meminfo=read_meminfo, docker_ps=docker_ps, cgroup_root=CGROUP_ROOT,
-           docker_stats=docker_stats, now=now_iso):
+           docker_stats=docker_stats, now=now_iso, read_disk_free=read_disk_free):
     """Append one sample to `path`, rotating afterwards. Returns the line."""
     mem = parse_meminfo(read_meminfo())
     s = Sample(boot_id=read_boot_id(), monotonic=read_monotonic(), time=now(),
                mem_available=mem["MemAvailable"], swap_free=mem["SwapFree"],
-               containers=container_memory(docker_ps(), cgroup_root, docker_stats))
+               containers=container_memory(docker_ps(), cgroup_root, docker_stats),
+               disk_free=read_disk_free())
     line = format_line(s)
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
