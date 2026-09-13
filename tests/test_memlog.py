@@ -4,9 +4,13 @@ Every reader is injected, so nothing here needs Docker, a cgroup tree, or
 the host clock (KTD9).
 """
 
+import datetime
+import json
+
 import pytest
 
-from agent_sandbox import config, memlog
+from agent_sandbox import cli, config, memlog
+from agent_sandbox.errors import SandboxError
 
 BOOT = "5e8933b9-ec47-4a27-872d-e9a1c365ce3a"
 OTHER_BOOT = "00000000-0000-0000-0000-000000000000"
@@ -208,9 +212,11 @@ def test_container_memory_finds_a_scope_under_the_admission_slice(tmp_path):
 def test_default_cgroup_roots_are_user_slice_then_the_admission_slice():
     from agent_sandbox.resources import ResourceConfig
     assert memlog.CGROUP_ROOTS == (config.user_manager_cgroup("user.slice"),
-                                   config.user_manager_cgroup(ResourceConfig.SLICE))
+                                   config.slice_cgroup(ResourceConfig.SLICE))
     assert memlog.SLICE_CGROUP_ROOT.name == "agent-sandbox.slice"
-    assert memlog.SLICE_CGROUP_ROOT.parent.name == f"user@{config.UID}.service"
+    # systemd nests a dashed slice under its prefix slice.
+    assert memlog.SLICE_CGROUP_ROOT.parent.name == "agent.slice"
+    assert memlog.SLICE_CGROUP_ROOT.parent.parent.name == f"user@{config.UID}.service"
 
 
 def test_sample_falls_back_to_docker_stats_when_a_directory_is_missing(tmp_path):
@@ -312,7 +318,6 @@ def test_log_path_lives_under_logs():
 
 # ---------------------------------------------------------------- cli wiring
 def test_cli_knows_memlog():
-    from agent_sandbox import cli
     assert "memlog" in cli.KNOWN
     args = cli.build_parser().parse_args(["memlog", "show", "--last", "3"])
     assert args.cmd == "memlog" and args.action == "show" and args.last == 3
@@ -349,3 +354,156 @@ def test_summarize_since_matches_the_single_purpose_readers(tmp_path):
     assert minimum == memlog.minimum_since(log, 15, "b") == (3 * 1024 ** 3, "t20")
     assert peaks == memlog.peak_containers(log, 15, "b") == {"c": (4 * 1024 ** 3, "t20")}
     assert [s.time for s in tail] == ["t30", "t40"]
+
+
+# ---------------------------------------------------------------- _since_monotonic
+@pytest.mark.parametrize("spec, secs", [("45s", 45), ("90m", 5400), ("2h", 7200),
+                                        ("1.5h", 5400), (" 10m ", 600)])
+def test_since_duration_is_subtracted_from_the_monotonic_clock(spec, secs):
+    assert cli._since_monotonic(spec, 10000.0) == pytest.approx(10000.0 - secs)
+
+
+def test_since_iso_time_lands_on_the_monotonic_scale():
+    then = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=600)
+    assert cli._since_monotonic(then.isoformat(), 10000.0) == pytest.approx(9400.0, abs=5)
+    # A naive time is read as local time.
+    naive = then.astimezone().replace(tzinfo=None).isoformat()
+    assert cli._since_monotonic(naive, 10000.0) == pytest.approx(9400.0, abs=5)
+
+
+@pytest.mark.parametrize("bad", ["yesterday", "90", "2d", "2026-13-01T00:00:00"])
+def test_since_garbage_is_a_sandbox_error_with_a_remedy(bad):
+    with pytest.raises(SandboxError) as e:
+        cli._since_monotonic(bad, 10000.0)
+    assert "neither a duration nor an ISO time" in e.value.message
+    assert "90m" in e.value.remedy
+
+
+# ---------------------------------------------------------------- cmd_memlog
+G = 1024 ** 3
+T1, T2 = "2026-09-13T15:50:00+00:00", "2026-09-13T16:00:00+00:00"
+
+
+@pytest.fixture
+def fake_memlog(home, monkeypatch):
+    """The log under the test home and every host reading `memlog` takes
+    injected; mutate the dict to steer a test."""
+    live = {"mono": 1060.0, "timer": True}
+    log = home / "logs" / "memory.log"
+    log.parent.mkdir()
+    monkeypatch.setattr(config, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(memlog, "LOG", log)
+    monkeypatch.setattr(memlog, "read_boot_id", lambda: BOOT)
+    monkeypatch.setattr(memlog, "read_monotonic", lambda: live["mono"])
+    monkeypatch.setattr(memlog, "timer_active", lambda: live["timer"])
+    live["log"] = log
+    return live
+
+
+def test_memlog_sample_appends_a_line_and_prints_it_under_json(fake_memlog, tmp_path,
+                                                                monkeypatch, capsys):
+    real = memlog.sample
+    monkeypatch.setattr(memlog, "sample", lambda path: real(
+        path, read_boot_id=lambda: BOOT, read_monotonic=lambda: 1.0,
+        read_meminfo=lambda: meminfo_text(), docker_ps=lambda: [],
+        cgroup_roots=[tmp_path / "nope"], docker_stats=lambda: {},
+        now=lambda: T2, read_disk_free=lambda: {"/": 40 * G}))
+    assert cli.main(["memlog", "sample", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"boot_id": BOOT, "monotonic": 1.0, "time": T2,
+                   "mem_available": 46810764 * 1024, "swap_free": 15623452 * 1024,
+                   "containers": {}, "disk_free": {"/": 40 * G}}
+    assert cli.main(["memlog", "sample"]) == 0
+    assert capsys.readouterr().out == ""
+    assert len(fake_memlog["log"].read_text().splitlines()) == 2
+
+
+def test_memlog_install_writes_units_through_the_cli(fake_memlog, home, monkeypatch, capsys):
+    calls = []
+    real = memlog.install
+    monkeypatch.setattr(memlog, "install",
+                        lambda: real(unit_dir=home / "units", run=calls.append))
+    assert cli.main(["memlog", "install"]) == 0
+    out = capsys.readouterr().out
+    assert f"wrote {home / 'units' / memlog.SERVICE}" in out
+    assert f"wrote {home / 'units' / memlog.TIMER}" in out
+    assert f"enabled {memlog.TIMER}; samples land in {fake_memlog['log']}" in out
+    assert ["systemctl", "--user", "enable", "--now", memlog.TIMER] in calls
+
+
+def test_memlog_show_json_reports_freshness_minimum_and_peaks(fake_memlog, capsys):
+    write(fake_memlog["log"], [
+        line(mono=400.0, when=T1, avail=38 * G, containers={"a": 1 * G}),
+        line(mono=1000.0, when=T2, avail=40 * G, containers={"a": 3 * G, "b": 2 * G}),
+    ])
+    assert cli.main(["memlog", "show", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out) == {"log", "timer_active", "fresh", "reason", "age_s",
+                        "minimum_since", "peaks_since", "samples"}
+    assert out["log"] == str(fake_memlog["log"]) and out["timer_active"] is True
+    assert out["fresh"] is True and out["reason"] == "fresh"
+    assert out["age_s"] == pytest.approx(60.0)
+    assert out["minimum_since"] == {"mem_available": 38 * G, "time": T1}
+    assert out["peaks_since"] == {
+        "a": {"bytes": 3 * G, "time": T2, "suggested_memory": memlog.suggest_memory(3 * G)},
+        "b": {"bytes": 2 * G, "time": T2, "suggested_memory": memlog.suggest_memory(2 * G)},
+    }
+    assert [s["monotonic"] for s in out["samples"]] == [400.0, 1000.0]
+    assert out["samples"][1]["containers"] == {"a": 3 * G, "b": 2 * G}
+    # --since narrows the minimum and the peaks; --last the sample tail.
+    assert cli.main(["memlog", "show", "--json", "--since", "2m", "--last", "1"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["minimum_since"] == {"mem_available": 40 * G, "time": T2}
+    assert out["peaks_since"]["a"]["bytes"] == 3 * G
+    assert [s["monotonic"] for s in out["samples"]] == [1000.0]
+
+
+def test_memlog_show_text_prints_samples_minimum_and_peaks(fake_memlog, capsys):
+    write(fake_memlog["log"], [
+        line(mono=400.0, when=T1, avail=38 * G, containers={"a": 1 * G}),
+        line(mono=1000.0, when=T2, avail=40 * G, containers={"a": 3 * G, "b": 2 * G}),
+    ])
+    assert cli.main(["memlog", "show"]) == 0
+    out = capsys.readouterr().out
+    assert f"{T1}  avail=38.0G  swap_free=16.0G  a=1024M\n" in out
+    assert f"{T2}  avail=40.0G  swap_free=16.0G  a=3072M b=2048M\n" in out
+    assert "last sample: fresh, 60 s old; timer active\n" in out
+    assert f"minimum MemAvailable since 1h: 38.0G at {T1}\n" in out
+    assert out.index("peak a: 3.00G") < out.index("peak b: 2.00G")
+    assert f"peak a: 3.00G at {T2}; next --memory {memlog.suggest_memory(3 * G)}\n" in out
+    assert "memlog install" not in out
+
+
+def test_memlog_show_stale_log_exits_1_and_points_at_install(fake_memlog, capsys):
+    write(fake_memlog["log"], [line(mono=1000.0, when=T2, containers={"a": 3 * G})])
+    fake_memlog["mono"] = 5000.0       # the last sample is 4000 s old
+    fake_memlog["timer"] = False
+    # --since is measured from the injected clock: 2h reaches back past the sample.
+    assert cli.main(["memlog", "show", "--json", "--since", "2h"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["fresh"] is False and "4000 s old" in out["reason"]
+    assert out["timer_active"] is False
+    assert out["peaks_since"]["a"]["bytes"] == 3 * G      # still summarised
+    assert cli.main(["memlog", "show", "--since", "2h"]) == 1
+    out = capsys.readouterr().out
+    assert "last sample: STALE: last sample is 4000 s old" in out
+    assert "timer INACTIVE" in out
+    assert "agent-sandbox memlog install" in out
+
+
+def test_memlog_show_with_no_log_says_so_and_exits_1(fake_memlog, capsys):
+    assert cli.main(["memlog", "show"]) == 1
+    out = capsys.readouterr().out
+    assert f"no samples in {fake_memlog['log']}\n" in out
+    assert "last sample: STALE:" in out and "no samples since 1h\n" in out
+    assert cli.main(["memlog", "show", "--json"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["fresh"] is False and out["minimum_since"] is None
+    assert out["peaks_since"] == {} and out["samples"] == []
+
+
+def test_memlog_show_bad_since_exits_1_with_the_remedy(fake_memlog, capsys):
+    assert cli.main(["memlog", "show", "--since", "yesterday"]) == 1
+    err = capsys.readouterr().err
+    assert "--since 'yesterday' is neither a duration nor an ISO time" in err
+    assert "→ Give a duration like 90m or 2h" in err

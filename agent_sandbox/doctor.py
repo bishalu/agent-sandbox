@@ -687,7 +687,7 @@ def parse_memory_max(text):
 def slice_cgroup_dir(uid=None):
     """Where the user manager keeps the slice's cgroup; absent until the
     first unit is placed in it."""
-    return config.user_manager_cgroup(SLICE, uid=uid)
+    return config.slice_cgroup(SLICE, uid=uid)
 
 
 def read_slice_memory_max():

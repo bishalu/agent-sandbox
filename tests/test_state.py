@@ -13,7 +13,7 @@ import shutil
 
 import pytest
 
-from agent_sandbox import cleanup, cli, config, state
+from agent_sandbox import cleanup, cli, state
 from agent_sandbox.metadata import RunRecord
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "runs"
@@ -42,18 +42,12 @@ def derive(e, exists, alive):
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
-    """A runs/ dir holding copies of the two real records, so a write-back
-    never touches the fixtures or the host's own runs."""
-    for k in list(os.environ):
-        if k.startswith("AGENT_SANDBOX_"):
-            monkeypatch.delenv(k)
-    runs = tmp_path / "runs"
+def home(home):
+    """The shared home, its runs/ dir holding copies of the two real
+    records, so a write-back never touches the fixtures or the host's
+    own runs."""
+    runs = home / "runs"
     shutil.copytree(FIXTURES, runs)
-    monkeypatch.setattr(config, "RUNS", runs)
-    monkeypatch.setattr(config, "LOCK_DIR", runs / ".locks")
-    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    monkeypatch.setattr(config, "ROOT", tmp_path)
     return runs
 
 

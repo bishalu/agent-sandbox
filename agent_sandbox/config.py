@@ -191,6 +191,22 @@ def user_manager_cgroup(*parts, uid=None):
     return CGROUP_USER_SLICE.joinpath(f"user-{uid}.slice", f"user@{uid}.service", *parts)
 
 
+def slice_cgroup_parts(slice_name):
+    """The nested directory names systemd gives a slice: "agent-sandbox.slice"
+    lives at agent.slice/agent-sandbox.slice, because a dash in a slice name
+    means "child of". Measured on this host: a container started with
+    --cgroup-parent=agent-sandbox.slice lands under
+    user@<uid>.service/agent.slice/agent-sandbox.slice/docker-<id>.scope."""
+    stem = slice_name[:-len(".slice")] if slice_name.endswith(".slice") else slice_name
+    pieces = stem.split("-")
+    return tuple("-".join(pieces[:i]) + ".slice" for i in range(1, len(pieces) + 1))
+
+
+def slice_cgroup(slice_name, uid=None):
+    """The cgroup directory of a user-manager slice, nesting included."""
+    return user_manager_cgroup(*slice_cgroup_parts(slice_name), uid=uid)
+
+
 def as_bool(value):
     """Booleans arrive as JSON booleans from config.json and as strings from
     the environment; both must read the same way."""

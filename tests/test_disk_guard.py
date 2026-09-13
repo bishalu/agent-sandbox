@@ -6,8 +6,6 @@ Every reading is injected (KTD9): no shutil.disk_usage on a real path the
 test did not choose, no cmd.exe, no /proc/version.
 """
 
-import os
-
 import pytest
 
 from agent_sandbox import admission, config, doctor, memlog, resources
@@ -40,22 +38,6 @@ def settings(**more):
 
 def disks(host=100 * G, root=40 * G):
     return {"/mnt/c": host, "/": root}
-
-
-@pytest.fixture
-def clean_env(monkeypatch):
-    for k in list(os.environ):
-        if k.startswith("AGENT_SANDBOX_"):
-            monkeypatch.delenv(k)
-
-
-@pytest.fixture
-def home(tmp_path, monkeypatch, clean_env):
-    monkeypatch.setattr(config, "RUNS", tmp_path / "runs")
-    monkeypatch.setattr(config, "LOCK_DIR", tmp_path / "runs" / ".locks")
-    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    monkeypatch.setattr(config, "ROOT", tmp_path)
-    return tmp_path
 
 
 # ---------------------------------------------------------------- decide

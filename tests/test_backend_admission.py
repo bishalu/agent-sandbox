@@ -36,13 +36,10 @@ class BrokenRecord(RunRecord):
 
 
 @pytest.fixture
-def home(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "RUNS", tmp_path / "runs")
-    monkeypatch.setattr(config, "LOCK_DIR", tmp_path / "runs" / ".locks")
-    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    monkeypatch.setattr(config, "ROOT", tmp_path)
+def home(home, monkeypatch):
+    """The shared home, with docker pointed nowhere."""
     monkeypatch.setattr(config, "docker_env", lambda: {"DOCKER_HOST": "unix:///nowhere"})
-    return tmp_path
+    return home
 
 
 def test_failed_record_save_after_admission_releases_the_handle(home, monkeypatch):

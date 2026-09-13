@@ -22,7 +22,7 @@ import sys
 
 import pytest
 
-from agent_sandbox import admission, config, doctor, memlog
+from agent_sandbox import admission, doctor, memlog
 from agent_sandbox.metadata import RunRecord
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "runs"
@@ -31,21 +31,11 @@ SLICE = "agent-sandbox.slice"
 
 
 @pytest.fixture
-def clean_env(monkeypatch):
-    for k in list(os.environ):
-        if k.startswith("AGENT_SANDBOX_"):
-            monkeypatch.delenv(k)
-
-
-@pytest.fixture
-def home(tmp_path, monkeypatch, clean_env):
-    """A runs/ dir with copies of the two real 2026-09-13 records."""
-    runs = tmp_path / "runs"
+def home(home):
+    """The shared home, its runs/ dir filled with copies of the two real
+    2026-09-13 records."""
+    runs = home / "runs"
     shutil.copytree(FIXTURES, runs)
-    monkeypatch.setattr(config, "RUNS", runs)
-    monkeypatch.setattr(config, "LOCK_DIR", runs / ".locks")
-    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    monkeypatch.setattr(config, "ROOT", tmp_path)
     return runs
 
 
@@ -356,7 +346,8 @@ def test_slice_cgroup_private_namespace_falls_back_to_the_host_reading(clean_env
 
 def test_slice_cgroup_dir_is_under_the_user_manager():
     p = doctor.slice_cgroup_dir(uid=1000)
-    assert str(p) == "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/agent-sandbox.slice"
+    assert str(p) == ("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+                     "/agent.slice/agent-sandbox.slice")
 
 
 # ---------------------------------------------------------------- the probe's backend

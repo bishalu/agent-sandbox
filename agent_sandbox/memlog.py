@@ -39,7 +39,7 @@ MEMINFO_FILE = pathlib.Path("/proc/meminfo")
 # managed container runs under agent-sandbox.slice (KTD8), so both roots are
 # tried before the slow `docker stats` fallback.
 CGROUP_ROOT = config.user_manager_cgroup("user.slice")
-SLICE_CGROUP_ROOT = config.user_manager_cgroup(ResourceConfig.SLICE)
+SLICE_CGROUP_ROOT = config.slice_cgroup(ResourceConfig.SLICE)
 CGROUP_ROOTS = (CGROUP_ROOT, SLICE_CGROUP_ROOT)
 
 TEMPLATE_DIR = pathlib.Path(__file__).resolve().parent.parent / "templates" / "systemd"

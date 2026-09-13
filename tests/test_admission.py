@@ -53,22 +53,6 @@ def roomy_disks(cfg=None):
     return {cfg.disk_path if cfg is not None else "/mnt/c": 100 * G, "/": 40 * G}
 
 
-@pytest.fixture
-def clean_env(monkeypatch):
-    for k in list(os.environ):
-        if k.startswith("AGENT_SANDBOX_"):
-            monkeypatch.delenv(k)
-
-
-@pytest.fixture
-def home(tmp_path, monkeypatch, clean_env):
-    monkeypatch.setattr(config, "RUNS", tmp_path / "runs")
-    monkeypatch.setattr(config, "LOCK_DIR", tmp_path / "runs" / ".locks")
-    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
-    monkeypatch.setattr(config, "ROOT", tmp_path)
-    return tmp_path
-
-
 # ---------------------------------------------------------------- decide
 def test_disabled_admits_regardless_of_inputs():
     d = admission.decide(100 * G, 100 * G, 0, stale(), 4242, settings(enabled=False))
@@ -536,3 +520,159 @@ def test_install_records_a_missing_systemctl_before_raising(home):
     state = json.loads(admission.state_file().read_text())
     assert state["ok"] is False
     assert "systemctl" in state["output"]
+
+
+# ---------------------------------------------------------------- cmd_admission
+@pytest.fixture
+def fake_readers(home, monkeypatch):
+    """Every reading `admission show` takes, injected; mutate the dict to
+    steer a test. `install` never touches the real home's dirs either."""
+    G2 = 2 * G
+    live = {
+        "rows": [{"name": "agent-sandbox-a", "memory_limit": 4 * G},
+                 {"name": "stray", "memory_limit": 0}],
+        "memlog": fresh({"agent-sandbox-a": G2, "stray": G2}),
+        "avail": 30 * G,
+    }
+    monkeypatch.setattr(config, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(admission, "inspect_running", lambda: live["rows"])
+    monkeypatch.setattr(admission, "read_memlog", lambda cfg: live["memlog"])
+    monkeypatch.setattr(admission, "read_mem_available", lambda: live["avail"])
+    monkeypatch.setattr(admission, "read_disk_free",
+                        lambda cfg: {cfg.disk_path: 100 * G, "/": 40 * G})
+    return live
+
+
+@pytest.fixture
+def fake_systemctl(monkeypatch):
+    """`admission install` through the CLI, with systemctl replaced; the
+    list of argv lists it was given, and `rc` to make it fail."""
+    class Systemctl:
+        rc = 0
+        calls = []
+
+        @classmethod
+        def run(cls, args):
+            cls.calls.append(args)
+            return subprocess.CompletedProcess(args, cls.rc, "", "Failed to set unit properties")
+
+    real = admission.install
+    monkeypatch.setattr(admission, "install", lambda budget: real(budget, run=Systemctl.run))
+    return Systemctl
+
+
+def write_cfg(home, **cfg):
+    config.CONFIG_FILE.write_text(json.dumps(cfg))
+
+
+def test_admission_install_json_caps_the_slice_and_records_it(home, fake_readers,
+                                                              fake_systemctl, capsys):
+    write_cfg(home, admission_memory_budget="16g")
+    assert cli.main(["admission", "install", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["slice"] == "agent-sandbox.slice"
+    assert out["memory_max"] == 16 * G and out["ok"] is True
+    assert fake_systemctl.calls == [["systemctl", "--user", "set-property", "agent-sandbox.slice",
+                               f"MemoryMax={16 * G}"]]
+    assert json.loads((home / "runs" / ".admission-state.json").read_text()) == out
+
+
+def test_admission_install_text_names_the_budget_source_and_says_when_off(
+        home, fake_readers, fake_systemctl, capsys):
+    write_cfg(home, admission_memory_budget="16g")
+    assert cli.main(["admission", "install"]) == 0
+    out = capsys.readouterr().out
+    assert "agent-sandbox.slice MemoryMax=16g (config budget)" in out
+    assert str(home / "runs" / ".admission-state.json") in out
+    assert "admission is off" in out and "config set admission_enabled true" in out
+    write_cfg(home, admission_memory_budget="16g", admission_enabled=True)
+    assert cli.main(["admission", "install"]) == 0
+    assert "admission is off" not in capsys.readouterr().out
+
+
+def test_admission_install_failure_exits_1_with_the_remedy(home, fake_readers,
+                                                           fake_systemctl, capsys):
+    fake_systemctl.rc = 1
+    assert cli.main(["admission", "install"]) == 1
+    err = capsys.readouterr().err
+    assert "could not set MemoryMax" in err and "Failed to set unit properties" in err
+    assert "is-system-running" in err
+
+
+def test_admission_show_json_decides_for_the_default_run_even_when_off(
+        home, fake_readers, fake_systemctl, capsys):
+    write_cfg(home, admission_memory_budget="32g")
+    assert cli.main(["admission", "show", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert set(out) == {"enabled", "sources", "wait_timeout_s", "wait_interval_s",
+                        "containers", "memlog", "decision", "slice"}
+    assert out["enabled"] is False and out["sources"]["budget"] == "config"
+    assert out["wait_timeout_s"] == 1800 and out["wait_interval_s"] == 30
+    assert out["containers"] == fake_readers["rows"]
+    assert out["memlog"] == {"fresh": True, "reason": "fresh", "age_s": 30.0}
+    assert out["slice"] is None                      # nothing installed yet
+    d = out["decision"]
+    assert d["verdict"] == "admit" and d["reasons"] == []
+    n = d["numbers"]
+    assert n["request"] == {"bytes": 16 * G, "source": "default"}
+    # 4g limit + a 2g unlimited container at the 1.25 factor.
+    assert n["committed"]["bytes"] == 4 * G + int(2 * G * admission.UNLIMITED_FACTOR)
+    assert n["mem_available"]["bytes"] == 30 * G
+    assert n["headroom"]["bytes"] == 32 * G - n["committed"]["bytes"]
+    assert n["disk_floor"]["bytes"] == 20 * G and n["disk_free:/"]["bytes"] == 40 * G
+    # After install, the recorded slice state rides along.
+    assert cli.main(["admission", "install", "--json"]) == 0
+    capsys.readouterr()
+    assert cli.main(["admission", "show", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["slice"]["memory_max"] == 32 * G
+
+
+def test_admission_show_text_lists_containers_usage_and_the_verdict(
+        home, fake_readers, fake_systemctl, capsys):
+    write_cfg(home, admission_memory_budget="32g", admission_enabled=True)
+    assert cli.main(["admission", "show"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("admission enabled (config)")
+    assert "  agent-sandbox-a: limit 4g, using 2g\n" in out
+    assert "  stray: limit unlimited, using 2g\n" in out
+    assert "memory log: fresh\n" in out
+    assert "slice not set: agent-sandbox admission install" in out
+    assert "a default run (16g) would: admit\n" in out
+    # A container the log has not seen yet prints its limit alone.
+    fake_readers["rows"].append({"name": "new", "memory_limit": 0})
+    assert cli.main(["admission", "install"]) == 0
+    capsys.readouterr()
+    assert cli.main(["admission", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "  new: limit unlimited\n" in out
+    assert "slice agent-sandbox.slice: MemoryMax=32g set 20" in out
+    assert "(FAILED)" not in out
+
+
+def test_admission_show_reports_a_stale_log_as_a_refusal(home, fake_readers, capsys):
+    fake_readers["memlog"] = stale()
+    write_cfg(home, admission_memory_budget="32g")
+    assert cli.main(["admission", "show", "--json"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["memlog"]["fresh"] is False and "400 s old" in out["memlog"]["reason"]
+    assert out["decision"]["verdict"] == "refuse"
+    assert out["decision"]["reasons"] == ["memory log stale: " + stale().reason]
+    assert cli.main(["admission", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "admission DISABLED (default)" in out
+    assert "memory log: STALE: last sample is 400 s old" in out
+    assert "would: refuse (memory log stale" in out
+
+
+@pytest.mark.parametrize("exc", [OSError("meminfo"), ValueError("MemAvailable")])
+def test_admission_show_treats_an_unreadable_meminfo_as_zero(home, fake_readers, monkeypatch,
+                                                              capsys, exc):
+    def boom():
+        raise exc
+    monkeypatch.setattr(admission, "read_mem_available", boom)
+    write_cfg(home, admission_memory_budget="32g")
+    assert cli.main(["admission", "show", "--json"]) == 0
+    d = json.loads(capsys.readouterr().out)["decision"]
+    assert d["numbers"]["mem_available"]["bytes"] == 0
+    assert d["verdict"] == "wait"
+    assert d["reasons"] == ["MemAvailable 0g below floor 8g"]

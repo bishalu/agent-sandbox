@@ -2,21 +2,12 @@
 route into every container's env through mounts.plan_for and the doctor's
 probe-output check. Pure: no Docker, no git."""
 
-import os
-
 import pytest
 
 from agent_sandbox import config, doctor, mounts, resources
 
 THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                "MKL_NUM_THREADS", "AGENT_SANDBOX_THREADS")
-
-
-@pytest.fixture
-def clean_env(monkeypatch):
-    for k in list(os.environ):
-        if k.startswith("AGENT_SANDBOX_"):
-            monkeypatch.delenv(k)
 
 
 @pytest.fixture
