@@ -665,6 +665,7 @@ def cmd_memlog(args):
         fresh = memlog.parse_last_sample(memlog.LOG, boot, mono, memlog.max_age_s(cfg))
         since = _since_monotonic(args.since, mono)
         minimum = memlog.minimum_since(memlog.LOG, since, boot)
+        peaks = memlog.peak_containers(memlog.LOG, since, boot)
         samples = list(memlog.iter_samples(memlog.LOG))[-args.last:]
         if args.json:
             print(json.dumps({
@@ -673,6 +674,9 @@ def cmd_memlog(args):
                 "fresh": fresh.fresh, "reason": fresh.reason, "age_s": fresh.age_s,
                 "minimum_since": ({"mem_available": minimum[0], "time": minimum[1]}
                                   if minimum else None),
+                "peaks_since": {n: {"bytes": b, "time": tm,
+                                    "suggested_memory": memlog.suggest_memory(b)}
+                                for n, (b, tm) in peaks.items()},
                 "samples": [dataclasses.asdict(s) for s in samples],
             }, indent=2))
             return 0 if fresh.fresh else 1
@@ -691,6 +695,9 @@ def cmd_memlog(args):
                   f"{minimum[0] / 1024 ** 3:.1f}G at {minimum[1]}")
         else:
             print(f"no samples since {args.since}")
+        for n, (b, tm) in sorted(peaks.items(), key=lambda kv: -kv[1][0]):
+            print(f"peak {n}: {b / 1024 ** 3:.2f}G at {tm}; "
+                  f"next --memory {memlog.suggest_memory(b)}")
         if not fresh.fresh:
             print(f"  → {PROG} memlog install   (then wait one minute)")
         return 0 if fresh.fresh else 1

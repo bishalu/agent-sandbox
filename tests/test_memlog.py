@@ -290,3 +290,22 @@ def test_cli_knows_memlog():
     assert "memlog" in cli.KNOWN
     args = cli.build_parser().parse_args(["memlog", "show", "--last", "3"])
     assert args.cmd == "memlog" and args.action == "show" and args.last == 3
+
+
+def test_peak_containers_and_suggest_memory(tmp_path):
+    log = tmp_path / "memory.log"
+    lines = []
+    for mono, used in ((100, 1 * 1024 ** 3), (160, 3 * 1024 ** 3), (220, 2 * 1024 ** 3)):
+        lines.append(memlog.format_line(memlog.Sample(
+            boot_id="b1", monotonic=mono, time=f"t{mono}", mem_available=40 * 1024 ** 3,
+            swap_free=0, containers={"m6": used, "mcp": 100 * 1024 ** 2})))
+    lines.append(memlog.format_line(memlog.Sample(
+        boot_id="b0", monotonic=999, time="old", mem_available=1, swap_free=0,
+        containers={"m6": 9 * 1024 ** 3})))
+    log.write_text("\n".join(lines) + "\n")
+    peaks = memlog.peak_containers(log, 150, "b1")
+    assert peaks["m6"] == (3 * 1024 ** 3, "t160")
+    assert peaks["mcp"][0] == 100 * 1024 ** 2
+    assert memlog.suggest_memory(3 * 1024 ** 3) == "4.5g"
+    assert memlog.suggest_memory(100 * 1024 ** 2) == "1g"
+    assert memlog.suggest_memory(int(2.1 * 1024 ** 3)) == "3.5g"

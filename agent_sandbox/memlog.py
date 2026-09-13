@@ -326,6 +326,31 @@ def minimum_since(path, since_monotonic, boot_id):
     return best
 
 
+def peak_containers(path, since_monotonic, boot_id):
+    """Per container, (largest memory.current, its wall time) over this boot's
+    samples at or after `since_monotonic`. This is what sizes the next
+    request for the same job: a milestone that peaked at 3 GB does not need
+    the 8 GB default, and the budget it leaves admits another run."""
+    peaks = {}
+    for s in iter_samples(path):
+        if s.boot_id != boot_id or s.monotonic < since_monotonic:
+            continue
+        for name, used in s.containers.items():
+            if name not in peaks or used > peaks[name][0]:
+                peaks[name] = (used, s.time)
+    return peaks
+
+
+def suggest_memory(peak_bytes, headroom=1.5, step=512 * 1024 ** 2, floor=1024 ** 3):
+    """A --memory value from a measured peak: the peak plus half again,
+    rounded up to 512 MiB, never below 1 GiB. Returned as a docker size
+    string ("3.5g" or "2g")."""
+    want = max(int(peak_bytes * headroom), floor)
+    steps = -(-want // step)
+    gib = steps * step / 1024 ** 3
+    return f"{gib:g}g"
+
+
 def max_age_s(cfg=None):
     return int(config.resolve("admission_memlog_max_age_s", None, cfg))
 
