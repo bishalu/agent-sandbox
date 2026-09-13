@@ -570,11 +570,11 @@ def cmd_admission(args):
     settings = admission.resolve_settings(cfg)
     if args.action == "install":
         config.ensure_dirs()
-        state = admission.install(settings.budget)
+        slice_state = admission.install(settings.budget)
         if args.json:
-            print(json.dumps(state, indent=2))
+            print(json.dumps(slice_state, indent=2))
         else:
-            print(f"{state['slice']} MemoryMax={admission.fmt(state['memory_max'])} "
+            print(f"{slice_state['slice']} MemoryMax={admission.fmt(slice_state['memory_max'])} "
                   f"({settings.sources['budget']} budget); recorded in {admission.state_file()}")
             if not settings.enabled:
                 print(f"admission is off; enable it with: {PROG} config set admission_enabled true")
@@ -596,7 +596,7 @@ def cmd_admission(args):
         d = admission.decide(res.memory_bytes, committed, avail, fresh, None, live,
                              request_source=res.memory_source,
                              disk_free=admission.read_disk_free(live))
-        state = admission.read_state()
+        slice_state = admission.read_state()
         if args.json:
             print(json.dumps({"enabled": settings.enabled, "sources": settings.sources,
                               "wait_timeout_s": settings.wait_timeout_s,
@@ -604,7 +604,7 @@ def cmd_admission(args):
                               "containers": rows, "memlog": {"fresh": fresh.fresh,
                                                              "reason": fresh.reason,
                                                              "age_s": fresh.age_s},
-                              "decision": d.to_dict(), "slice": state}, indent=2))
+                              "decision": d.to_dict(), "slice": slice_state}, indent=2))
         else:
             print(f"admission {'enabled' if settings.enabled else 'DISABLED'} "
                   f"({settings.sources['enabled']}); {admission.describe(d)}")
@@ -614,9 +614,9 @@ def cmd_admission(args):
                 print(f"  {r['name']}: limit {lim}"
                       + (f", using {admission.fmt(used)}" if used is not None else ""))
             print(f"memory log: {'fresh' if fresh.fresh else 'STALE: ' + fresh.reason}")
-            if state:
-                print(f"slice {state['slice']}: MemoryMax={admission.fmt(state['memory_max'])} "
-                      f"set {state['set_at']}" + ("" if state["ok"] else " (FAILED)"))
+            if slice_state:
+                print(f"slice {slice_state['slice']}: MemoryMax={admission.fmt(slice_state['memory_max'])} "
+                      f"set {slice_state['set_at']}" + ("" if slice_state["ok"] else " (FAILED)"))
             else:
                 print(f"slice not set: {PROG} admission install")
             print(f"a default run ({admission.fmt(res.memory_bytes)}) would: {d.verdict}"
@@ -664,9 +664,7 @@ def cmd_memlog(args):
         mono = memlog.read_monotonic()
         fresh = memlog.parse_last_sample(memlog.LOG, boot, mono, memlog.max_age_s(cfg))
         since = _since_monotonic(args.since, mono)
-        minimum = memlog.minimum_since(memlog.LOG, since, boot)
-        peaks = memlog.peak_containers(memlog.LOG, since, boot)
-        samples = list(memlog.iter_samples(memlog.LOG))[-args.last:]
+        minimum, peaks, samples = memlog.summarize_since(memlog.LOG, since, boot, args.last)
         if args.json:
             print(json.dumps({
                 "log": str(memlog.LOG),
@@ -686,9 +684,9 @@ def cmd_memlog(args):
                   f"swap_free={s.swap_free / 1024 ** 3:.1f}G  {cs}")
         if not samples:
             print(f"no samples in {memlog.LOG}")
-        state = "fresh" if fresh.fresh else f"STALE: {fresh.reason}"
+        freshness = "fresh" if fresh.fresh else f"STALE: {fresh.reason}"
         age = f", {fresh.age_s:.0f} s old" if fresh.age_s is not None else ""
-        print(f"last sample: {state}{age}; timer "
+        print(f"last sample: {freshness}{age}; timer "
               f"{'active' if memlog.timer_active() else 'INACTIVE'}")
         if minimum:
             print(f"minimum MemAvailable since {args.since}: "

@@ -309,3 +309,17 @@ def test_peak_containers_and_suggest_memory(tmp_path):
     assert memlog.suggest_memory(3 * 1024 ** 3) == "4.5g"
     assert memlog.suggest_memory(100 * 1024 ** 2) == "1g"
     assert memlog.suggest_memory(int(2.1 * 1024 ** 3)) == "3.5g"
+
+
+def test_summarize_since_matches_the_single_purpose_readers(tmp_path):
+    log = tmp_path / "memory.log"
+    rows = []
+    for mono, avail, used in ((10, 5, 1), (20, 3, 4), (30, 4, 2), (40, 6, 3)):
+        rows.append(memlog.format_line(memlog.Sample(
+            boot_id="b", monotonic=mono, time=f"t{mono}", mem_available=avail * 1024 ** 3,
+            swap_free=0, containers={"c": used * 1024 ** 3})))
+    log.write_text("\n".join(rows) + "\n")
+    minimum, peaks, tail = memlog.summarize_since(log, 15, "b", last=2)
+    assert minimum == memlog.minimum_since(log, 15, "b") == (3 * 1024 ** 3, "t20")
+    assert peaks == memlog.peak_containers(log, 15, "b") == {"c": (4 * 1024 ** 3, "t20")}
+    assert [s.time for s in tail] == ["t30", "t40"]

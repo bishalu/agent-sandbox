@@ -12,6 +12,7 @@ launcher threads serialize on it in tests.
 """
 
 import fcntl
+import hashlib
 import os
 import pathlib
 import threading
@@ -114,3 +115,9 @@ class FileFlock:
 
     def __exit__(self, *exc):
         self.release()
+
+
+def repo_hash(repo):
+    """The short stable hash both per-repo lock files are named by, so the
+    direct lock and the milestone lock cannot drift apart."""
+    return hashlib.sha256(str(repo).encode()).hexdigest()[:16]

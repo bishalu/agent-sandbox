@@ -7,15 +7,12 @@ images, networks or volumes, and never on a schedule.
 
 import datetime
 import shutil
-import subprocess
 
 from . import config, state, worktree
 from .metadata import RunRecord
 
 
-def _docker(args):
-    return subprocess.run(["docker"] + args, env=config.docker_env(),
-                          capture_output=True, text=True)
+_docker = config.run_docker
 
 
 def age_days(rec):

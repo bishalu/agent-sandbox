@@ -24,14 +24,13 @@ disk and the 16:34 death was disk, not memory.
 
 import dataclasses
 import datetime
-import hashlib
 import json
 import subprocess
 import sys
 import threading
 import time
 
-from . import config, locks, memlog, resources
+from . import config, locks, memlog, metadata, resources
 from .errors import AdmissionRefused, AdmissionTimeout, SandboxError
 
 ADMISSION_LOCK = "admission.lock"
@@ -177,9 +176,7 @@ def decide(request, committed, mem_available, memlog_sample, project_locked, cfg
 
 
 # ---------------------------------------------------------------- readers
-def _docker(args):
-    return subprocess.run(["docker"] + args, env=config.docker_env(),
-                          capture_output=True, text=True)
+_docker = config.run_docker
 
 
 def parse_inspect(text):
@@ -229,7 +226,7 @@ def state_file():
 
 
 def project_lock_path(repo, lock_dir=None):
-    h = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
+    h = locks.repo_hash(repo)
     return (config.LOCK_DIR if lock_dir is None else lock_dir) / f"milestone-{h}.lock"
 
 
@@ -245,21 +242,22 @@ class Admission:
         self.thread = None
 
     def release_when_visible(self, container_name, inspect_exists=inspect_exists,
-                             timeout=VISIBLE_TIMEOUT_S, poll=0.5,
+                             timeout=VISIBLE_TIMEOUT_S, poll=0.1, max_poll=2.0,
                              sleep=time.sleep, now=time.monotonic):
         """Drop the flock once `docker inspect` sees the container, or after
-        `timeout`: from then on the container itself counts in the budget."""
+        `timeout`: from then on the container itself counts in the budget.
+        The poll starts fast and doubles, since the container usually appears
+        within the first tick and a slow start should not cost sixty inspects."""
         def watch():
             deadline = now() + timeout
+            delay = poll
             while now() < deadline and not inspect_exists(container_name):
-                sleep(poll)
+                sleep(delay)
+                delay = min(delay * 2, max_poll)
             self.flock.release()
         self.thread = threading.Thread(target=watch, daemon=True)
         self.thread.start()
         return self.thread
-
-    def release_admission(self):
-        self.flock.release()
 
     def release(self):
         """Both locks; called from the backend's cleanup. Idempotent."""
@@ -400,9 +398,7 @@ def install(budget_bytes, run=_systemctl, path=None, slice_name=resources.Resour
              "command": " ".join(args),
              "set_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2) + "\n")
-    tmp.replace(path)
+    metadata._write_atomic(path, state)
     if not ok:
         raise SandboxError(f"could not set MemoryMax on {slice_name}: {output}",
                            "Check `systemctl --user is-system-running`; the user "

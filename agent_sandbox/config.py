@@ -206,6 +206,15 @@ def parse_value(text):
     return text
 
 
+def run_docker(args):
+    """One docker CLI call with the rootless daemon's environment, output
+    captured. Shared by every module that reads the daemon without owning a
+    backend (cleanup, admission, memlog)."""
+    import subprocess
+    return subprocess.run(["docker"] + args, env=docker_env(),
+                          capture_output=True, text=True)
+
+
 def docker_env():
     """A clean environment for docker subprocesses.
 

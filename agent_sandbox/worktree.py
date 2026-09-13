@@ -7,7 +7,6 @@ nested worktrees confuse tools that walk upward looking for a repo root.
 Central storage keeps the source repo untouched.
 """
 
-import hashlib
 import pathlib
 import re
 import secrets
@@ -16,6 +15,7 @@ import subprocess
 
 from . import config
 from .errors import LockHeld, RepoError, WorktreeError
+from . import locks
 from .locks import PidLock
 
 _SLUG = re.compile(r"[^a-z0-9]+")
@@ -105,8 +105,7 @@ class DirectLock(PidLock):
     """
 
     def __init__(self, repo):
-        h = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
-        super().__init__(config.LOCK_DIR / f"{h}.lock", note=str(repo))
+        super().__init__(config.LOCK_DIR / f"{locks.repo_hash(repo)}.lock", note=str(repo))
         self.repo = str(repo)
 
     def _held_error(self, holder):

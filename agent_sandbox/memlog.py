@@ -86,9 +86,7 @@ def now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
-def _docker(args):
-    return subprocess.run(["docker"] + args, env=config.docker_env(),
-                          capture_output=True, text=True)
+_docker = config.run_docker
 
 
 def docker_ps():
@@ -339,6 +337,25 @@ def peak_containers(path, since_monotonic, boot_id):
             if name not in peaks or used > peaks[name][0]:
                 peaks[name] = (used, s.time)
     return peaks
+
+
+def summarize_since(path, since_monotonic, boot_id, last=5):
+    """One pass over the log: (minimum MemAvailable, per-container peaks,
+    the newest `last` samples). `show` calls this instead of reading the
+    file three times; the two single-purpose functions stay for admission."""
+    import collections
+    minimum, peaks = None, {}
+    tail = collections.deque(maxlen=last if last > 0 else 0)
+    for s in iter_samples(path):
+        tail.append(s)
+        if s.boot_id != boot_id or s.monotonic < since_monotonic:
+            continue
+        if minimum is None or s.mem_available < minimum[0]:
+            minimum = (s.mem_available, s.time)
+        for name, used in s.containers.items():
+            if name not in peaks or used > peaks[name][0]:
+                peaks[name] = (used, s.time)
+    return minimum, peaks, list(tail)
 
 
 def suggest_memory(peak_bytes, headroom=1.5, step=512 * 1024 ** 2, floor=1024 ** 3):
