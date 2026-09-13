@@ -6,13 +6,16 @@ substrate without going through this file (R-12).
 """
 
 import argparse
+import dataclasses
+import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 
-from . import (agent_home, cleanup, config, credentials, doctor, gitdir, plugins,
-               image, mounts, resources, worktree)
+from . import (agent_home, cleanup, config, credentials, doctor, gitdir, memlog,
+               plugins, image, mounts, resources, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
 from .errors import SandboxError
@@ -456,6 +459,78 @@ def cmd_config(args):
     return 1
 
 
+# ---------------------------------------------------------------- memlog
+def _since_monotonic(spec, mono_now):
+    """`--since` as a duration (90s, 30m, 2h) or an ISO time, on the monotonic scale."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh])", spec.strip())
+    if m:
+        secs = float(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+        return mono_now - secs
+    try:
+        then = datetime.datetime.fromisoformat(spec)
+    except ValueError:
+        raise SandboxError(f"--since {spec!r} is neither a duration nor an ISO time",
+                           "Give a duration like 90m or 2h, or an ISO time like "
+                           "2026-09-13T16:00:00+00:00.")
+    if then.tzinfo is None:
+        then = then.astimezone()
+    elapsed = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    return mono_now - elapsed
+
+
+def cmd_memlog(args):
+    if args.action == "install":
+        config.ensure_dirs()
+        written = memlog.install()
+        for path in written:
+            print(f"wrote {path}")
+        print(f"enabled {memlog.TIMER}; samples land in {memlog.LOG}")
+        return 0
+    if args.action == "sample":
+        config.ensure_dirs()
+        line = memlog.sample(memlog.LOG)
+        if args.json:
+            print(json.dumps(dataclasses.asdict(memlog.parse_line(line))))
+        return 0
+    if args.action == "show":
+        cfg = config.load_config()
+        boot = memlog.read_boot_id()
+        mono = memlog.read_monotonic()
+        fresh = memlog.parse_last_sample(memlog.LOG, boot, mono, memlog.max_age_s(cfg))
+        since = _since_monotonic(args.since, mono)
+        minimum = memlog.minimum_since(memlog.LOG, since, boot)
+        samples = list(memlog.iter_samples(memlog.LOG))[-args.last:]
+        if args.json:
+            print(json.dumps({
+                "log": str(memlog.LOG),
+                "timer_active": memlog.timer_active(),
+                "fresh": fresh.fresh, "reason": fresh.reason, "age_s": fresh.age_s,
+                "minimum_since": ({"mem_available": minimum[0], "time": minimum[1]}
+                                  if minimum else None),
+                "samples": [dataclasses.asdict(s) for s in samples],
+            }, indent=2))
+            return 0 if fresh.fresh else 1
+        for s in samples:
+            cs = " ".join(f"{n}={b / 1024 ** 2:.0f}M" for n, b in s.containers.items())
+            print(f"{s.time}  avail={s.mem_available / 1024 ** 3:.1f}G  "
+                  f"swap_free={s.swap_free / 1024 ** 3:.1f}G  {cs}")
+        if not samples:
+            print(f"no samples in {memlog.LOG}")
+        state = "fresh" if fresh.fresh else f"STALE: {fresh.reason}"
+        age = f", {fresh.age_s:.0f} s old" if fresh.age_s is not None else ""
+        print(f"last sample: {state}{age}; timer "
+              f"{'active' if memlog.timer_active() else 'INACTIVE'}")
+        if minimum:
+            print(f"minimum MemAvailable since {args.since}: "
+                  f"{minimum[0] / 1024 ** 3:.1f}G at {minimum[1]}")
+        else:
+            print(f"no samples since {args.since}")
+        if not fresh.fresh:
+            print(f"  → {PROG} memlog install   (then wait one minute)")
+        return 0 if fresh.fresh else 1
+    return 1
+
+
 # ---------------------------------------------------------------- parser
 def build_parser():
     p = argparse.ArgumentParser(
@@ -553,10 +628,21 @@ def build_parser():
     sp.add_argument("key", nargs="?")
     sp.add_argument("value", nargs="?")
 
+    sp = sub.add_parser("memlog", help="the per-minute memory log launches depend on")
+    sp.add_argument("action", choices=["install", "sample", "show"],
+                    help="install: enable the systemd --user timer; sample: append one "
+                         "line now; show: recent samples, freshness, and the minimum")
+    sp.add_argument("--last", type=int, default=5, metavar="N",
+                    help="show: how many recent samples to print (default 5)")
+    sp.add_argument("--since", default="1h", metavar="WHEN",
+                    help="show: minimum MemAvailable since a duration (90m, 2h) "
+                         "or an ISO time (default 1h)")
+    sp.add_argument("--json", action="store_true")
+
     return p
 
 
-KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config"}
+KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config", "memlog"}
 
 
 def main(argv=None):
@@ -592,6 +678,8 @@ def main(argv=None):
             return cmd_build(args)
         if args.cmd == "config":
             return cmd_config(args)
+        if args.cmd == "memlog":
+            return cmd_memlog(args)
     except SandboxError as e:
         return _fail(e)
     except KeyboardInterrupt:

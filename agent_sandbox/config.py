@@ -57,6 +57,10 @@ DEFAULTS = {
     # registries are copied into the agent home and the cache and marketplace
     # directories mount read-only at their host paths.
     "mirror_plugins": True,
+    # The memory log's staleness rule (KTD5): a launch refuses when the newest
+    # sample is older than this many seconds by the monotonic clock. Three
+    # missed one-minute ticks; the timer's own cadence is not configurable.
+    "admission_memlog_max_age_s": 180,
 }
 
 _ENV = {
@@ -67,6 +71,7 @@ _ENV = {
     "timeout": "AGENT_SANDBOX_TIMEOUT",
     "network": "AGENT_SANDBOX_NETWORK",
     "image": "AGENT_SANDBOX_IMAGE",
+    "admission_memlog_max_age_s": "AGENT_SANDBOX_ADMISSION_MEMLOG_MAX_AGE_S",
 }
 
 

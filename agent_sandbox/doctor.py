@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 
-from . import (agent_home, cleanup, config, credentials, image, mounts,
+from . import (agent_home, cleanup, config, credentials, image, memlog, mounts,
                resources, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
@@ -332,6 +332,25 @@ def _host_checks(cfg):
         checks.append(Check("agent home template", PASS, str(t)))
     except SandboxError as e:
         checks.append(Check("agent home template", FAIL, e.message, e.remedy or ""))
+
+    # --- memory log (R8, KTD5): the timer runs and the last sample is fresh ---
+    # A launch fails closed on this log, so a stopped timer or a stale line
+    # is a failed launch waiting to happen, not a warning.
+    active, fresh = memlog.health(cfg)
+    ok = active and fresh.fresh
+    if active and fresh.fresh:
+        detail = f"timer active, last sample {fresh.age_s:.0f} s old"
+    elif active:
+        detail = f"timer active but {fresh.reason}"
+    else:
+        detail = f"timer inactive; {fresh.reason}" if not fresh.fresh else \
+            f"timer inactive; last sample {fresh.age_s:.0f} s old"
+    checks.append(Check(
+        "memlog", PASS if ok else FAIL, detail,
+        "" if ok else
+        f"agent-sandbox memlog install   (enables {memlog.TIMER}; a sample lands within a minute)\n"
+        f"     Launches refuse admission until the newest line of {memlog.LOG} is fresh.",
+    ))
 
     # --- credential expiry (R-18, D18): only the expiry field is read ---
     f = credentials.CREDENTIALS_FILE
