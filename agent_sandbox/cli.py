@@ -6,19 +6,25 @@ substrate without going through this file (R-12).
 """
 
 import argparse
+import dataclasses
+import datetime
 import json
 import os
 import pathlib
+import re
 import sys
 
-from . import (agent_home, cleanup, config, credentials, doctor, gitdir, plugins,
-               image, mounts, resources, worktree)
+from . import (admission, agent_home, cleanup, config, credentials, doctor, gitdir,
+               memlog, plugins, image, mounts, resources, state, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
-from .errors import SandboxError
+from .errors import AdmissionRefused, AdmissionTimeout, SandboxError
 from .metadata import RunRecord
 
 PROG = "agent-sandbox"
+# A launch that admission refused or timed out (R2). Distinct from 1 so a
+# driver can tell "wait and retry" from "broken".
+EXIT_ADMISSION = 3
 
 
 # ---------------------------------------------------------------- helpers
@@ -34,6 +40,30 @@ def _fail(err):
         for line in str(remedy).splitlines():
             _eprint(f"  → {line}")
     return 1
+
+
+def _fail_admission(err, as_json):
+    """Exit 3 with the reasons and numbers, as one JSON object under --json."""
+    if as_json:
+        print(json.dumps({"admission": err.kind, "message": err.message,
+                          "reasons": err.reasons, "numbers": err.decision.numbers,
+                          "remedy": err.remedy}, indent=2))
+    else:
+        _fail(err)
+    return EXIT_ADMISSION
+
+
+def _parse_tags(items):
+    """`--tag key=value`, repeatable, into a dict. The driver tags each run
+    with its unit and milestone; `milestone` also selects the project lock."""
+    tags = {}
+    for item in items or []:
+        key, eq, value = item.partition("=")
+        if not eq or not key.strip():
+            raise SandboxError(f"--tag needs key=value, got {item!r}",
+                               "Example: --tag unit=milestone-app-6 --tag milestone=6")
+        tags[key.strip()] = value
+    return tags
 
 
 def _split_command(argv):
@@ -146,7 +176,9 @@ def cmd_run(args, command):
 
     # Nothing is created before the backend proves it can run: a Docker
     # outage must not leave an orphan worktree and branch behind (R-20).
-    backend = LocalDockerBackend(strict_caps=args.strict_caps)
+    tags = _parse_tags(args.tag)
+    backend = LocalDockerBackend(strict_caps=args.strict_caps,
+                                 force_admission=args.force, wait=args.wait)
     backend.preflight()
     mounts.skill_mounts(cfg)            # config errors surface before anything exists
     if not args.direct:
@@ -163,7 +195,7 @@ def cmd_run(args, command):
     # credentials, mount planning) must leave a sandbox that `list` and `rm`
     # can see, never an invisible worktree and branch (R-20).
     rec.update(repo=ws.repo, workspace=str(ws.path), workspace_kind=ws.kind,
-               branch=ws.branch).save()
+               branch=ws.branch, tags=tags).save()
 
     try:
         # Gitignored secrets the repo keeps beside its code (R-23). Done first:
@@ -173,7 +205,7 @@ def cmd_run(args, command):
         rec.update(seeded=seeded).save()
 
         img = config.resolve("image", args.image, cfg)
-        image.ensure(img, quiet=bool(args.json))
+        image.ensure(img, quiet=bool(args.json), force=args.force_build)
 
         home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=bool(args.json))
         mirrored = plugins.sync(home, cfg)
@@ -183,7 +215,7 @@ def cmd_run(args, command):
             with_full_claude_state=args.with_full_claude_state,
             agent_home=home,
         )
-        plan = mounts.plan_for(ws, cfg, home)
+        plan = mounts.plan_for(ws, cfg, home, resources=res)
 
         rec.update(
             repo=ws.repo, workspace=str(ws.path), workspace_kind=ws.kind,
@@ -278,10 +310,12 @@ def cmd_enter(args, command):
     mode = config.resolve("mode", args.mode, cfg)
     network = config.resolve("network", args.network, cfg)
     img = config.resolve("image", args.image, cfg)
+    tags = _parse_tags(args.tag)
 
-    backend = LocalDockerBackend(strict_caps=args.strict_caps)
+    backend = LocalDockerBackend(strict_caps=args.strict_caps,
+                                 force_admission=args.force, wait=args.wait)
     backend.preflight()
-    image.ensure(img, quiet=bool(args.json))
+    image.ensure(img, quiet=bool(args.json), force=args.force_build)
 
     # Gitignored secrets are refreshed from the source checkout on every
     # start, so a key rotated on the host reaches a resumed sandbox (R-23).
@@ -299,9 +333,9 @@ def cmd_enter(args, command):
         with_full_claude_state=args.with_full_claude_state,
         agent_home=home,
     )
-    plan = mounts.plan_for(ws, cfg, home)
+    plan = mounts.plan_for(ws, cfg, home, resources=res)
     rec.update(resources=res.to_dict(), credentials=creds.to_dict(),
-               mode=mode, network=network, image=img,
+               mode=mode, network=network, image=img, tags=tags,
                agent_home=str(home.path),
                mounts=[m.to_dict() for m in plan.mounts],
                trusted_mounts=[m.to_dict() for m in plan.trusted]).save()
@@ -349,6 +383,77 @@ def cmd_list(args):
             status += " (gone)"
         print(f"{r.sandbox_id:<28} {status:<10} {age:>5.1f}d  "
               f"{(d.get('workspace_kind') or '?'):<9} {d.get('workspace') or ''}")
+    return 0
+
+
+# ---------------------------------------------------------------- status
+def _status_probes():
+    """The two live readings `status` derives from: one `docker ps -a` over
+    our label answers container_exists for every entry, and os.kill(pid, 0)
+    answers pid_alive. Preflight first, so a daemon that is down is an error
+    with a remedy, never "every container is gone" (R7)."""
+    backend = LocalDockerBackend()
+    backend.preflight()
+    names = {row["name"] for row in backend.list_containers()}
+    return names.__contains__, state.pid_alive
+
+
+def cmd_status(args):
+    recs = RunRecord.all()
+    if args.sandbox_id:
+        wanted = set(args.sandbox_id)
+        recs = [r for r in recs if r.sandbox_id in wanted]
+        missing = wanted - {r.sandbox_id for r in recs}
+        if missing:
+            return _fail(SandboxError(f"no such sandbox: {', '.join(sorted(missing))}",
+                                      f"{PROG} list shows every sandbox id"))
+    container_exists, pid_alive = _status_probes()
+    settings = admission.resolve_settings(config.load_config())
+    probes = dict(container_exists=container_exists, pid_alive=pid_alive,
+                  wait_timeout_s=settings.wait_timeout_s,
+                  wait_interval_s=settings.wait_interval_s)
+
+    rows = []
+    for rec in recs:
+        derived = state.derive_record(rec, **probes)
+        reconciled = None
+        if args.reconcile and derived.changed:
+            reconciled = state.reconcile(rec.file, **probes)
+            fresh = RunRecord.load_path(rec.file)
+            if fresh is not None:
+                rec = fresh
+                derived = state.derive_record(rec, **probes)
+        d = rec.data
+        row = derived.to_dict(rec)
+        row.update({
+            "tags": d.get("tags") or {},
+            "workspace": d.get("workspace"),
+            "branch": d.get("branch"),
+            "logs": d.get("logs"),
+            "reconciled": reconciled.to_dict() if reconciled else None,
+        })
+        rows.append(row)
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no sandboxes")
+        return 0
+    print(f"{'SANDBOX ID':<28} {'STATE':<9} {'NEWEST':<10} {'FIX':>3}  {'TAGS':<22} EVIDENCE")
+    for row in rows:
+        newest = row["newest"] or {}
+        tags = ",".join(f"{k}={v}" for k, v in sorted(row["tags"].items())) or "-"
+        fix = row["corrections"]
+        if row["reconciled"]:
+            fix = f"{len(row['reconciled']['corrected'])}w" if row["reconciled"]["written"] else "!"
+        print(f"{row['sandbox_id']:<28} {row['state']:<9} {(newest.get('status') or '-'):<10} "
+              f"{str(fix):>3}  {tags[:22]:<22} {newest.get('evidence') or '-'}")
+    if any(r["corrections"] and not r["reconciled"] for r in rows) and not args.reconcile:
+        _eprint(f"[{PROG}] FIX counts stale entries; {PROG} status --reconcile corrects them")
+    for r in rows:
+        if r["reconciled"] and not r["reconciled"]["written"]:
+            _eprint(f"[{PROG}] {r['sandbox_id']}: not written: {r['reconciled']['reason']}")
     return 0
 
 
@@ -428,6 +533,8 @@ def cmd_doctor(args):
 # ---------------------------------------------------------------- build
 def cmd_build(args):
     try:
+        # KTD7: no image build beside a running sandbox, from either build path.
+        image.refuse_build_while_running(force=args.force_build)
         image.build(config.resolve("image", args.image), no_cache=args.no_cache)
     except SandboxError as e:
         return _fail(e)
@@ -446,13 +553,152 @@ def cmd_config(args):
         if not args.key or args.value is None:
             _eprint(f"{PROG}: usage: {PROG} config set <key> <value>")
             return 1
-        val = args.value
-        if val.isdigit():
-            val = int(val)
-        cfg[args.key] = val
+        val = config.parse_value(args.value)
+        if val is None:
+            cfg.pop(args.key, None)          # `null` restores the default
+        else:
+            cfg[args.key] = val
         config.save_config(cfg)
-        print(f"{args.key} = {val}")
+        print(f"{args.key} = {val if isinstance(val, str) else json.dumps(val)}")
         return 0
+    return 1
+
+
+# ---------------------------------------------------------------- admission
+def cmd_admission(args):
+    cfg = config.load_config()
+    settings = admission.resolve_settings(cfg)
+    if args.action == "install":
+        config.ensure_dirs()
+        slice_state = admission.install(settings.budget)
+        if args.json:
+            print(json.dumps(slice_state, indent=2))
+        else:
+            print(f"{slice_state['slice']} MemoryMax={admission.fmt(slice_state['memory_max'])} "
+                  f"({settings.sources['budget']} budget); recorded in {admission.state_file()}")
+            if not settings.enabled:
+                print(f"admission is off; enable it with: {PROG} config set admission_enabled true")
+        return 0
+    if args.action == "show":
+        # The same readings a launch takes, decided for the default request,
+        # so a refusal can be understood without launching anything.
+        res = resources.ResourceConfig(cfg=cfg)
+        fresh = admission.read_memlog(settings)
+        rows = admission.inspect_running()
+        committed = admission.committed_memory(rows, fresh.sample, settings.budget)
+        try:
+            avail = admission.read_mem_available()
+        except (OSError, ValueError):
+            avail = 0
+        # `show` always decides, even when admission is off, so the numbers
+        # are visible before a host turns it on.
+        live = dataclasses.replace(settings, enabled=True)
+        d = admission.decide(res.memory_bytes, committed, avail, fresh, None, live,
+                             request_source=res.memory_source,
+                             disk_free=admission.read_disk_free(live))
+        slice_state = admission.read_state()
+        if args.json:
+            print(json.dumps({"enabled": settings.enabled, "sources": settings.sources,
+                              "wait_timeout_s": settings.wait_timeout_s,
+                              "wait_interval_s": settings.wait_interval_s,
+                              "containers": rows, "memlog": {"fresh": fresh.fresh,
+                                                             "reason": fresh.reason,
+                                                             "age_s": fresh.age_s},
+                              "decision": d.to_dict(), "slice": slice_state}, indent=2))
+        else:
+            print(f"admission {'enabled' if settings.enabled else 'DISABLED'} "
+                  f"({settings.sources['enabled']}); {admission.describe(d)}")
+            for r in rows:
+                lim = admission.fmt(r["memory_limit"]) if r["memory_limit"] else "unlimited"
+                used = (fresh.sample.containers.get(r["name"]) if fresh.sample else None)
+                print(f"  {r['name']}: limit {lim}"
+                      + (f", using {admission.fmt(used)}" if used is not None else ""))
+            print(f"memory log: {'fresh' if fresh.fresh else 'STALE: ' + fresh.reason}")
+            if slice_state:
+                print(f"slice {slice_state['slice']}: MemoryMax={admission.fmt(slice_state['memory_max'])} "
+                      f"set {slice_state['set_at']}" + ("" if slice_state["ok"] else " (FAILED)"))
+            else:
+                print(f"slice not set: {PROG} admission install")
+            print(f"a default run ({admission.fmt(res.memory_bytes)}) would: {d.verdict}"
+                  + (f" ({'; '.join(d.reasons)})" if d.reasons else ""))
+        return 0
+    return 1
+
+
+# ---------------------------------------------------------------- memlog
+def _since_monotonic(spec, mono_now):
+    """`--since` as a duration (90s, 30m, 2h) or an ISO time, on the monotonic scale."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh])", spec.strip())
+    if m:
+        secs = float(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+        return mono_now - secs
+    try:
+        then = datetime.datetime.fromisoformat(spec)
+    except ValueError:
+        raise SandboxError(f"--since {spec!r} is neither a duration nor an ISO time",
+                           "Give a duration like 90m or 2h, or an ISO time like "
+                           "2026-09-13T16:00:00+00:00.")
+    if then.tzinfo is None:
+        then = then.astimezone()
+    elapsed = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    return mono_now - elapsed
+
+
+def cmd_memlog(args):
+    if args.action == "install":
+        config.ensure_dirs()
+        written = memlog.install()
+        for path in written:
+            print(f"wrote {path}")
+        print(f"enabled {memlog.TIMER}; samples land in {memlog.LOG}")
+        return 0
+    if args.action == "sample":
+        config.ensure_dirs()
+        line = memlog.sample(memlog.LOG)
+        if args.json:
+            print(json.dumps(dataclasses.asdict(memlog.parse_line(line))))
+        return 0
+    if args.action == "show":
+        cfg = config.load_config()
+        boot = memlog.read_boot_id()
+        mono = memlog.read_monotonic()
+        fresh = memlog.parse_last_sample(memlog.LOG, boot, mono, memlog.max_age_s(cfg))
+        since = _since_monotonic(args.since, mono)
+        minimum, peaks, samples = memlog.summarize_since(memlog.LOG, since, boot, args.last)
+        if args.json:
+            print(json.dumps({
+                "log": str(memlog.LOG),
+                "timer_active": memlog.timer_active(),
+                "fresh": fresh.fresh, "reason": fresh.reason, "age_s": fresh.age_s,
+                "minimum_since": ({"mem_available": minimum[0], "time": minimum[1]}
+                                  if minimum else None),
+                "peaks_since": {n: {"bytes": b, "time": tm,
+                                    "suggested_memory": memlog.suggest_memory(b)}
+                                for n, (b, tm) in peaks.items()},
+                "samples": [dataclasses.asdict(s) for s in samples],
+            }, indent=2))
+            return 0 if fresh.fresh else 1
+        for s in samples:
+            cs = " ".join(f"{n}={b / 1024 ** 2:.0f}M" for n, b in s.containers.items())
+            print(f"{s.time}  avail={s.mem_available / 1024 ** 3:.1f}G  "
+                  f"swap_free={s.swap_free / 1024 ** 3:.1f}G  {cs}")
+        if not samples:
+            print(f"no samples in {memlog.LOG}")
+        freshness = "fresh" if fresh.fresh else f"STALE: {fresh.reason}"
+        age = f", {fresh.age_s:.0f} s old" if fresh.age_s is not None else ""
+        print(f"last sample: {freshness}{age}; timer "
+              f"{'active' if memlog.timer_active() else 'INACTIVE'}")
+        if minimum:
+            print(f"minimum MemAvailable since {args.since}: "
+                  f"{minimum[0] / 1024 ** 3:.1f}G at {minimum[1]}")
+        else:
+            print(f"no samples since {args.since}")
+        for n, (b, tm) in sorted(peaks.items(), key=lambda kv: -kv[1][0]):
+            print(f"peak {n}: {b / 1024 ** 3:.2f}G at {tm}; "
+                  f"next --memory {memlog.suggest_memory(b)}")
+        if not fresh.fresh:
+            print(f"  → {PROG} memlog install   (then wait one minute)")
+        return 0 if fresh.fresh else 1
     return 1
 
 
@@ -470,6 +716,7 @@ def build_parser():
   {PROG} . -- npm test              one-shot command
   {PROG} . --direct -- pytest       operate on the live checkout (locked)
   {PROG} list                       show sandboxes
+  {PROG} status --json              derived state of every container entry
   {PROG} enter app-1a2b3c4d         reopen an existing workspace
   {PROG} clean --docker             sweep old sandboxes and docker junk
 """)
@@ -480,6 +727,8 @@ def build_parser():
                         help="capability profile (default from config)")
         sp.add_argument("--cpus")
         sp.add_argument("--memory")
+        sp.add_argument("--force-build", action="store_true",
+                        help="rebuild a stale image even while a managed container runs")
         sp.add_argument("--pids-limit", dest="pids_limit")
         sp.add_argument("--timeout", help="hard wall-clock ceiling, e.g. 12h")
         sp.add_argument("--network", choices=["full", "none", "restricted"])
@@ -496,6 +745,16 @@ def build_parser():
                         help="run under gVisor; forfeits enforced resource limits")
         sp.add_argument("--image")
         sp.add_argument("--json", action="store_true")
+        sp.add_argument("--tag", action="append", metavar="KEY=VALUE", default=[],
+                        help="label this run (repeatable); `milestone=<n>` also takes "
+                             "the project's milestone lock")
+        wait = sp.add_mutually_exclusive_group()
+        wait.add_argument("--wait", dest="wait", action="store_true", default=True,
+                          help="wait for admission headroom (the default)")
+        wait.add_argument("--no-wait", dest="wait", action="store_false",
+                          help="fail at once instead of waiting for headroom")
+        sp.add_argument("--force", action="store_true",
+                        help="bypass admission control for this run")
         # Worktrees persist by default (R-04). --rm opts into disposing of the
         # workspace on a clean exit; it never discards work after a failure.
         keep = sp.add_mutually_exclusive_group()
@@ -522,6 +781,15 @@ def build_parser():
     sp = sub.add_parser("list", help="list sandboxes")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("status", help="the derived state of every sandbox's containers")
+    sp.add_argument("sandbox_id", nargs="*",
+                    help="only these sandboxes (default: all)")
+    sp.add_argument("--reconcile", action="store_true",
+                    help="write the corrections (crashed / orphaned entries and the "
+                         "top-level status) back to run.json, guarded against a "
+                         "record that changed under the read")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("rm", help="remove a sandbox workspace")
     sp.add_argument("sandbox_id")
     sp.add_argument("--force", action="store_true")
@@ -546,6 +814,8 @@ def build_parser():
 
     sp = sub.add_parser("build", help="build the base image")
     sp.add_argument("--no-cache", action="store_true")
+    sp.add_argument("--force-build", action="store_true",
+                    help="build even while a managed container runs")
     sp.add_argument("--image")
 
     sp = sub.add_parser("config", help="show or set persistent defaults")
@@ -553,10 +823,28 @@ def build_parser():
     sp.add_argument("key", nargs="?")
     sp.add_argument("value", nargs="?")
 
+    sp = sub.add_parser("admission", help="the memory budget launches are admitted under")
+    sp.add_argument("action", choices=["install", "show"],
+                    help="install: cap the agent-sandbox.slice at the budget; "
+                         "show: the effective numbers and what a run would get")
+    sp.add_argument("--json", action="store_true")
+
+    sp = sub.add_parser("memlog", help="the per-minute memory log launches depend on")
+    sp.add_argument("action", choices=["install", "sample", "show"],
+                    help="install: enable the systemd --user timer; sample: append one "
+                         "line now; show: recent samples, freshness, and the minimum")
+    sp.add_argument("--last", type=int, default=5, metavar="N",
+                    help="show: how many recent samples to print (default 5)")
+    sp.add_argument("--since", default="1h", metavar="WHEN",
+                    help="show: minimum MemAvailable since a duration (90m, 2h) "
+                         "or an ISO time (default 1h)")
+    sp.add_argument("--json", action="store_true")
+
     return p
 
 
-KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config"}
+KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config", "memlog",
+         "admission", "status"}
 
 
 def main(argv=None):
@@ -582,6 +870,8 @@ def main(argv=None):
             return cmd_enter(args, command)
         if args.cmd == "list":
             return cmd_list(args)
+        if args.cmd == "status":
+            return cmd_status(args)
         if args.cmd == "rm":
             return cmd_rm(args)
         if args.cmd == "clean":
@@ -592,6 +882,12 @@ def main(argv=None):
             return cmd_build(args)
         if args.cmd == "config":
             return cmd_config(args)
+        if args.cmd == "memlog":
+            return cmd_memlog(args)
+        if args.cmd == "admission":
+            return cmd_admission(args)
+    except (AdmissionRefused, AdmissionTimeout) as e:
+        return _fail_admission(e, getattr(args, "json", False))
     except SandboxError as e:
         return _fail(e)
     except KeyboardInterrupt:

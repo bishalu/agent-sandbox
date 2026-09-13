@@ -5,6 +5,7 @@ trivial container, because `docker info` succeeding does not prove the
 runtime can start one.
 """
 
+import glob
 import json
 import os
 import pathlib
@@ -15,14 +16,24 @@ import subprocess
 import tempfile
 import time
 
-from . import (agent_home, cleanup, config, credentials, image, mounts,
-               resources, worktree)
+from . import (admission, agent_home, cleanup, config, credentials, image, locks,
+               memlog, mounts, resources, state, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
 from .errors import SandboxError
 from .metadata import RunRecord
 
 PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+
+G = 1024 ** 3
+
+# The disk guard's WSL half (KTD11): the distro's root is a file on the
+# Windows drive; when it is not sparse, freed guest blocks never return to
+# Windows and the drive fills until a write burst kills the VM.
+CMD_EXE = pathlib.Path("/mnt/c/Windows/System32/cmd.exe")
+VHDX_GLOB = "/mnt/c/Users/*/AppData/Local/wsl/*/ext4.vhdx"
+VHDX_REMEDY = ("wsl --shutdown; wsl --manage <Distro> --set-sparse true; "
+               "then fstrim -v / as root (wsl.exe -u root -- fstrim -v /)")
 
 # Doctor output lands in evidence files; never let a value that looks like a
 # secret through, whatever a probe printed (R-22).
@@ -84,8 +95,7 @@ def run_checks(quick=False, with_quota=False):
     ))
 
     # --- cgroup v2 delegation ---
-    cg = pathlib.Path("/sys/fs/cgroup/user.slice") / f"user-{os.getuid()}.slice" / \
-        f"user@{os.getuid()}.service" / "cgroup.controllers"
+    cg = config.user_manager_cgroup("cgroup.controllers")
     delegated = cg.read_text().split() if cg.exists() else []
     need = {"cpu", "memory", "pids"}
     ok = need.issubset(set(delegated))
@@ -280,6 +290,13 @@ def run_checks(quick=False, with_quota=False):
     elif need:
         checks.append(Check("worktree sandbox probe", WARN, "skipped: image not built",
                             "Run `agent-sandbox build` first."))
+    if quick or need:
+        # The thread-env and slice-cgroup checks read the probe's output; no
+        # probe, no reading.
+        checks.append(thread_env_check(None, resources.ResourceConfig(cfg=cfg).thread_env()))
+        settings = _settings_or_none(cfg)
+        if settings is not None:
+            checks.append(slice_cgroup_check(None, settings))
     checks += _drift_checks()
     return checks
 
@@ -333,6 +350,25 @@ def _host_checks(cfg):
     except SandboxError as e:
         checks.append(Check("agent home template", FAIL, e.message, e.remedy or ""))
 
+    # --- memory log (R8, KTD5): the timer runs and the last sample is fresh ---
+    # A launch fails closed on this log, so a stopped timer or a stale line
+    # is a failed launch waiting to happen, not a warning.
+    checks.append(memlog_health_check(*memlog.health(cfg)))
+
+    # --- admission (U7): config coherent, records honest, locks live, slice capped ---
+    checks.append(admission_config_check(cfg, admission.read_state()))
+    checks.append(stale_running_live(cfg))
+    checks.append(project_locks_check(config.LOCK_DIR))
+    settings = _settings_or_none(cfg)
+    if settings is not None:
+        checks.append(slice_memory_max_check(settings, read_slice_memory_max(),
+                                             slice_cgroup_dir().exists()))
+
+    # --- disk guard (KTD11): the host drive floor and, under WSL, a sparse vhdx ---
+    checks.append(host_disk_check(cfg))
+    if "microsoft" in platform.uname().release.lower():
+        checks.append(vhdx_sparse_check(cfg))
+
     # --- credential expiry (R-18, D18): only the expiry field is read ---
     f = credentials.CREDENTIALS_FILE
     if f.exists():
@@ -355,6 +391,392 @@ def _host_checks(cfg):
     return checks
 
 
+# ---------------------------------------------------------------- memlog (R8, KTD5)
+def memlog_health_check(active, fresh):
+    """The memlog timer runs and the last sample is fresh. `active` is
+    whether the systemd user timer is active; `fresh` is the Freshness of the
+    log's last line. A launch fails closed on this log, so a stopped timer or
+    a stale line is a failed launch waiting to happen, not a warning."""
+    ok = active and fresh.fresh
+    if active and fresh.fresh:
+        detail = f"timer active, last sample {fresh.age_s:.0f} s old"
+    elif active:
+        detail = f"timer active but {fresh.reason}"
+    elif fresh.fresh:
+        detail = f"timer inactive; last sample {fresh.age_s:.0f} s old"
+    else:
+        detail = f"timer inactive; {fresh.reason}"
+    return Check(
+        "memlog", PASS if ok else FAIL, detail,
+        "" if ok else
+        f"agent-sandbox memlog install   (enables {memlog.TIMER}; a sample lands within a minute)\n"
+        f"     Launches refuse admission until the newest line of {memlog.LOG} is fresh.")
+
+
+# ---------------------------------------------------------------- disk guard (KTD11)
+def host_disk_check(cfg, read_disk_free=memlog.disk_free):
+    """Every path the disk guard reads (the host drive backing the guest and
+    the guest root, `memlog.disk_paths`) has the admission floor free. A
+    launch refuses when any is below it or unreadable, so this is a FAIL,
+    not a warning."""
+    paths = memlog.disk_paths(cfg)
+    path = paths[0]
+    floor_gb = float(config.resolve("admission_disk_floor_gb", None, cfg))
+    readings = read_disk_free(paths)
+    free_by_path = {p: readings.get(p) for p in paths}
+    remedy = (
+        f"Free space on {path}, the drive that holds this distro's ext4.vhdx under WSL:\n"
+        "     empty the Windows recycle bin and Downloads, `agent-sandbox clean --docker`\n"
+        "     (dangling images and build cache), `agent-sandbox clean` (old sandboxes).\n"
+        "     Freed guest blocks only reach Windows when the vhdx is sparse; as owner:\n"
+        f"     {VHDX_REMEDY}\n"
+        f"     Launches refuse admission while any of {', '.join(paths)} is below {floor_gb:g} GiB.")
+    detail = ", ".join(
+        f"{p}: {'free space unreadable' if free is None else f'{free / G:.1f} GiB free'}"
+        for p, free in free_by_path.items())
+    ok = all(free is not None and free / G >= floor_gb for free in free_by_path.values())
+    return Check("host disk", PASS if ok else FAIL,
+                 f"{detail} (floor {floor_gb:g} GiB)", "" if ok else remedy)
+
+
+def windows_path(path):
+    """/mnt/<drive>/... as the Windows path fsutil wants; anything else unchanged."""
+    m = re.match(r"^/mnt/([a-zA-Z])(/.*)?$", str(path))
+    if not m:
+        return str(path)
+    rest = (m.group(2) or "").replace("/", "\\")
+    return f"{m.group(1).upper()}:{rest}"
+
+
+def fsutil_sparse_queryflag(path, cmd_exe=CMD_EXE, run=subprocess.run):
+    """`fsutil sparse queryflag` through cmd.exe interop; None when cmd.exe
+    is not there (not WSL, or interop off). The text is returned raw."""
+    cmd_exe = pathlib.Path(cmd_exe)
+    if not cmd_exe.exists():
+        return None
+    try:
+        p = run([str(cmd_exe), "/c", "fsutil", "sparse", "queryflag", windows_path(path)],
+                capture_output=True, timeout=30)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    out = (p.stdout or b"") + (p.stderr or b"")
+    return out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+
+
+def vhdx_candidates(cfg, glob_paths=glob.glob):
+    """`admission_vhdx_path` when set, then every distro's ext4.vhdx under
+    the Windows profiles."""
+    found = []
+    configured = config.resolve("admission_vhdx_path", None, cfg)
+    if configured:
+        found.append(str(configured))
+    for p in sorted(glob_paths(VHDX_GLOB)):
+        if p not in found:
+            found.append(p)
+    return found
+
+
+def vhdx_sparse_check(cfg, run=fsutil_sparse_queryflag, find=vhdx_candidates):
+    """Under WSL, every distro vhdx is sparse. A file that cannot be found or
+    cmd.exe missing is a WARN: the check could not run, which is not the
+    same as the disk being at risk."""
+    paths = find(cfg)
+    if not paths:
+        return Check("vhdx sparse", WARN, f"no ext4.vhdx found under {VHDX_GLOB}",
+                     "Set admission_vhdx_path in config.json to the distro's ext4.vhdx "
+                     "so doctor can check it.")
+    results, bad, unknown = [], [], []
+    for path in paths:
+        out = run(path)
+        if out is None:
+            return Check("vhdx sparse", WARN, f"{CMD_EXE} not available; cannot query {path}",
+                         "Windows interop is off or this is not WSL; check by hand: "
+                         "fsutil sparse queryflag <vhdx> in an elevated prompt.")
+        text = " ".join(out.replace("\x00", "").replace("\r", "").split())
+        if "NOT set as sparse" in text:
+            bad.append(path)
+            results.append(f"{path}: NOT set as sparse")
+        elif "is set as sparse" in text:
+            results.append(f"{path}: sparse")
+        else:
+            unknown.append(path)
+            results.append(f"{path}: unrecognised fsutil output: {text[:120]}")
+    detail = "; ".join(results)
+    if bad:
+        return Check("vhdx sparse", FAIL, detail, VHDX_REMEDY)
+    if unknown:
+        return Check("vhdx sparse", WARN, detail,
+                     "Check by hand: fsutil sparse queryflag <vhdx> in an elevated prompt.")
+    return Check("vhdx sparse", PASS, detail)
+
+
+
+# ---------------------------------------------------------------- admission (U7)
+SLICE = resources.ResourceConfig.SLICE
+INSTALL_REMEDY = ("agent-sandbox admission install   (sets MemoryMax on "
+                  f"{SLICE} to the budget and records it)")
+# KTD8: if rootless Docker refuses a user-manager slice as cgroup parent, the
+# budget is held by the whole user service instead, and the owner sets that.
+SLICE_FALLBACK = (
+    f"Rootless Docker did not place the container in {SLICE}, so the slice's MemoryMax\n"
+    "     does not bound the sandboxes. The KTD8 fallback is MemoryMax on the whole user\n"
+    "     service, set by the owner:\n"
+    f"     sudo systemctl set-property user@{os.getuid()}.service MemoryMax=<budget>\n"
+    "     Then the budget bounds everything this user runs, not only sandboxes.")
+
+
+def _settings_or_none(cfg):
+    """The admission settings, or None when they do not parse; the admission
+    config row reports why, so the other rows do not repeat it."""
+    try:
+        return admission.resolve_settings(cfg)
+    except SandboxError:
+        return None
+
+
+def probe_backend():
+    """The sandbox probe's backend bypasses admission the way `--force` does
+    (KTD9): a stale memory log or a full disk is the memlog or host disk
+    row's finding, never a failed probe."""
+    return LocalDockerBackend(force_admission=True)
+
+
+def admission_config_check(cfg, slice_state=None):
+    """The admission_* keys parse and cohere, and when admission is on, the
+    slice cap `admission install` recorded matches the budget. `slice_state`
+    is `admission.read_state()`: None when nothing was recorded."""
+    name = "admission config"
+    keys_remedy = ("Check the admission_* keys in config.json and any "
+                   "AGENT_SANDBOX_ADMISSION_* variables.")
+    try:
+        s = admission.resolve_settings(cfg)
+    except SandboxError as e:
+        return Check(name, FAIL, e.message, f"{keys_remedy} {e.remedy or ''}".strip())
+    src = s.sources
+    summary = (f"budget={admission.fmt(s.budget)} ({src['budget']}) "
+               f"floor={admission.fmt(s.floor)} ({src['floor']}) "
+               f"disk_floor={admission.fmt(s.disk_floor)} ({src['disk_floor']}) "
+               f"wait={s.wait_interval_s:g}/{s.wait_timeout_s:g}s "
+               f"memlog_max_age={s.memlog_max_age_s:g}s")
+    problems = []
+    if s.budget <= 0:
+        problems.append(f"budget {admission.fmt(s.budget)} is not above 0")
+    if s.floor < 0:
+        problems.append(f"floor {s.floor / G:g}g is below 0")
+    if s.disk_floor < 0:
+        problems.append(f"disk floor {s.disk_floor / G:g}g is below 0")
+    if s.wait_interval_s <= 0:
+        problems.append(f"wait interval {s.wait_interval_s:g}s is not above 0")
+    if s.wait_interval_s >= s.wait_timeout_s:
+        problems.append(f"wait interval {s.wait_interval_s:g}s is not below the wait "
+                        f"timeout {s.wait_timeout_s:g}s")
+    if problems:
+        return Check(name, FAIL, "; ".join(problems) + f" ({summary})", keys_remedy)
+    if not s.enabled:
+        return Check(name, PASS, f"disabled ({src['enabled']}); {summary}")
+    if slice_state is None:
+        return Check(name, WARN, f"enabled ({src['enabled']}); {summary}; "
+                                 f"no slice cap recorded in {admission.state_file()}",
+                     INSTALL_REMEDY)
+    if not slice_state.get("ok", False):
+        return Check(name, FAIL, f"enabled; {summary}; the last `admission install` failed: "
+                                 f"{slice_state.get('output') or '?'}", INSTALL_REMEDY)
+    recorded = int(slice_state.get("memory_max") or 0)
+    if recorded != s.budget:
+        return Check(name, FAIL,
+                     f"enabled; {summary}; recorded slice MemoryMax={admission.fmt(recorded)} "
+                     f"differs from budget {admission.fmt(s.budget)}", INSTALL_REMEDY)
+    return Check(name, PASS, f"enabled ({src['enabled']}); {summary}; slice "
+                             f"MemoryMax={admission.fmt(recorded)} recorded "
+                             f"{slice_state.get('set_at', '?')}")
+
+
+def stale_running_check(records, container_exists, pid_alive,
+                        wait_timeout_s=state.DEFAULT_WAIT_TIMEOUT_S,
+                        wait_interval_s=state.DEFAULT_WAIT_INTERVAL_S):
+    """No run.json entry says running (or waiting) while its container is
+    gone. `state.derive_record` over every record with the injected probes;
+    entries it would correct to crashed are the finding."""
+    name = "stale running entries"
+    stale, orphaned = [], []
+    for rec in records:
+        d = state.derive_record(rec, container_exists, pid_alive,
+                                wait_timeout_s=wait_timeout_s, wait_interval_s=wait_interval_s)
+        crashed = [e for _, e in d.changes if e.corrected == "crashed"]
+        gone = [e for _, e in d.changes if e.corrected == "orphaned"]
+        if crashed:
+            stale.append(f"{rec.sandbox_id}: {len(crashed)} "
+                         f"{'entry says' if len(crashed) == 1 else 'entries say'} "
+                         f"{'/'.join(sorted({e.recorded for e in crashed}))}, "
+                         f"container{'s' if len(crashed) > 1 else ''} gone")
+        if gone:
+            orphaned.append(f"{rec.sandbox_id}: {len(gone)} orphaned "
+                            f"(container up, launcher gone)")
+    if stale:
+        return Check(name, FAIL, "; ".join(stale),
+                     "agent-sandbox status --reconcile   (marks them crashed through the "
+                     "re-read guard; the driver's resume finishes what they left)")
+    if orphaned:
+        return Check(name, WARN, "; ".join(orphaned),
+                     "agent-sandbox status --reconcile   (records them as orphaned; the "
+                     "container keeps running without its launcher)")
+    n = len(list(records))
+    return Check(name, PASS, f"{n} record{'s' if n != 1 else ''}, every running entry "
+                             "has its container")
+
+
+def stale_running_live(cfg):
+    """`stale_running_check` over the host's records with the real probes:
+    one `docker ps -a` over our label and os.kill(pid, 0)."""
+    try:
+        names = {row["name"] for row in LocalDockerBackend().list_containers()}
+    except Exception as e:  # doctor keeps going; the daemon rows say what is wrong
+        return Check("stale running entries", WARN, f"could not list containers: {e}")
+    s = _settings_or_none(cfg)
+    kw = {}
+    if s is not None:
+        kw = dict(wait_timeout_s=s.wait_timeout_s, wait_interval_s=s.wait_interval_s)
+    return stale_running_check(RunRecord.all(), names.__contains__, state.pid_alive, **kw)
+
+
+def project_locks_check(lock_dir, pid_alive=state.pid_alive):
+    """No lock file under LOCK_DIR is held by a dead pid. The admission flock
+    carries no pid and is skipped; a file without a pid is unreadable, not
+    dead. The PidLock rule: a dead holder is reclaimed by the next taker."""
+    name = "project locks"
+    lock_dir = pathlib.Path(lock_dir)
+    files = sorted(p for p in lock_dir.glob("*.lock")
+                   if p.name != admission.ADMISSION_LOCK) if lock_dir.is_dir() else []
+    if not files:
+        return Check(name, PASS, f"no lock files under {lock_dir}")
+    dead, live, unreadable = [], [], []
+    for path in files:
+        h = locks.PidLock(path).holder()
+        if h is None:
+            unreadable.append(path.name)
+            continue
+        pid, note = h
+        if pid_alive(pid) is False:
+            dead.append(f"{path.name} (pid {pid} dead; {note})")
+        else:
+            live.append(f"{path.name} (pid {pid} {note})")
+    if dead:
+        return Check(name, FAIL, "; ".join(dead),
+                     "The next launch for that project reclaims a dead holder's lock on its "
+                     "own; to clear it now:\n     rm "
+                     + " ".join(str(lock_dir / d.split(" ")[0]) for d in dead))
+    if unreadable:
+        return Check(name, WARN, "unreadable (no pid inside): " + ", ".join(unreadable),
+                     "A lock without a pid is reclaimed by the next taker; delete it if it "
+                     "is not a lock at all.")
+    return Check(name, PASS, "held by live processes: " + "; ".join(live))
+
+
+_MEMORY_MAX = re.compile(r"MemoryMax=(\S+)")
+
+
+def parse_memory_max(text):
+    """Bytes from `systemctl show -p MemoryMax`; None for infinity, no
+    line, or no text."""
+    m = _MEMORY_MAX.search(text or "")
+    if not m or not m.group(1).isdigit():
+        return None
+    return int(m.group(1))
+
+
+def slice_cgroup_dir(uid=None):
+    """Where the user manager keeps the slice's cgroup; absent until the
+    first unit is placed in it."""
+    return config.slice_cgroup(SLICE, uid=uid)
+
+
+def read_slice_memory_max():
+    p = _sh(["systemctl", "--user", "show", SLICE, "-p", "MemoryMax"])
+    return p.stdout if p and p.returncode == 0 else None
+
+
+def slice_memory_max_check(settings, show_output, cgroup_exists):
+    """When admission is on, the slice's MemoryMax equals the budget (KTD8).
+    `show_output` is `systemctl --user show agent-sandbox.slice -p
+    MemoryMax` (None when systemctl could not answer); `cgroup_exists` is
+    whether the slice's cgroup directory is there, which it is not until
+    something has run in the slice."""
+    name = "slice memory.max"
+    if not settings.enabled:
+        return Check(name, PASS, f"admission disabled; {SLICE} is not required")
+    if show_output is None:
+        return Check(name, WARN, f"systemctl --user show {SLICE} gave no answer",
+                     "Check `systemctl --user is-system-running`, then " + INSTALL_REMEDY)
+    got = parse_memory_max(show_output)
+    budget = settings.budget
+    if got == budget:
+        return Check(name, PASS, f"{SLICE} MemoryMax={admission.fmt(got)} = budget"
+                                 + ("" if cgroup_exists else " (slice not started yet)"))
+    m = _MEMORY_MAX.search(show_output)
+    shown = (admission.fmt(got) if got is not None else (m.group(1) if m else "unset"))
+    if not cgroup_exists:
+        return Check(name, WARN,
+                     f"{SLICE} MemoryMax={shown} (budget {admission.fmt(budget)}); nothing "
+                     "has run in the slice yet, so no cgroup to read", INSTALL_REMEDY)
+    return Check(name, FAIL,
+                 f"{SLICE} MemoryMax={shown} differs from budget {admission.fmt(budget)}",
+                 INSTALL_REMEDY)
+
+
+_CGROUP_LINE = re.compile(r"^CGROUP=(.*)$", re.M)
+
+
+def slice_cgroup_check(probe_output, settings, slice_cgroup_exists=None):
+    """The probe container ran inside agent-sandbox.slice (KTD8).
+
+    Reads the `CGROUP=` line the sandbox probe echoes from /proc/self/cgroup
+    rather than starting a container of its own; None means the probe did
+    not run. A private cgroup namespace (Docker's default on cgroup v2)
+    shows the container `0::/`, so then `slice_cgroup_exists`, read on the
+    host right after the probe, decides.
+    """
+    name = "slice cgroup parent"
+    if probe_output is None:
+        return Check(name, WARN, "probe not run",
+                     "Run `agent-sandbox doctor` without --quick, after `agent-sandbox build`.")
+    if not settings.enabled:
+        return Check(name, PASS, f"admission disabled; containers are not placed in {SLICE}")
+    m = _CGROUP_LINE.search(probe_output)
+    if not m:
+        return Check(name, FAIL,
+                     "the probe printed no CGROUP line; a daemon that refuses "
+                     f"--cgroup-parent={SLICE} does not start the container at all",
+                     SLICE_FALLBACK)
+    path = m.group(1).strip()
+    if SLICE in path:
+        return Check(name, PASS, f"probe container ran in {path}")
+    if re.fullmatch(r"0::/\s*", path):
+        if slice_cgroup_exists:
+            return Check(name, PASS,
+                         f"the container's cgroup namespace hides its path ({path}); "
+                         f"{slice_cgroup_dir()} exists on the host after the probe ran")
+        return Check(name, FAIL,
+                     f"the container's cgroup namespace hides its path ({path}) and "
+                     f"{slice_cgroup_dir()} is absent on the host after the probe ran",
+                     SLICE_FALLBACK)
+    return Check(name, FAIL, f"probe container ran in {path}, outside {SLICE}", SLICE_FALLBACK)
+
+
+PROBE_SCRIPT = (
+    "echo x > probe && git add probe && git commit -qm probe && echo COMMIT_OK;"
+    " C=$(git rev-parse --path-format=absolute --git-common-dir);"
+    " (touch \"$C/hooks/doctor\" 2>/dev/null && echo HOOK_WRITABLE) || echo HOOK_RO;"
+    " git worktree prune && echo PRUNE_OK;"
+    " echo BRIDGE_TEMPLATE=$(PI_CODING_AGENT_DIR=/opt/agent-sandbox/pi-agent-template pi --list-models 2>/dev/null | grep -c claude-bridge);"
+    " echo BRIDGE_HOME=$(pi --list-models 2>/dev/null | grep -c claude-bridge);"
+    " mkdir -p /tmp/nocreds && G=$(CLAUDE_CONFIG_DIR=/tmp/nocreds claude -p hi --dangerously-skip-permissions 2>&1 | head -c 400);"
+    " case \"$G\" in *'cannot be used with root'*) echo GATE_CLOSED;; *'ot logged in'*|*'login'*|*'Login'*) echo GATE_OPEN;; *) echo \"GATE_UNKNOWN: $G\";; esac;"
+    " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN;"
+    " echo THREADS=$OMP_NUM_THREADS,$OPENBLAS_NUM_THREADS,$MKL_NUM_THREADS,$AGENT_SANDBOX_THREADS;"
+    " echo CGROUP=$(tr '\\n' ' ' < /proc/self/cgroup)"
+)
+
+
 def _sandbox_probe(cfg, with_quota=False):
     """One throwaway repo, two containers: commit, overlays, bridge, gate, persistence."""
     checks = []
@@ -365,9 +787,9 @@ def _sandbox_probe(cfg, with_quota=False):
         img = config.resolve("image", None, cfg)
         home = agent_home.ensure(ws.sandbox_id, cfg, img, quiet=True)
         creds = credentials.resolve(sandbox_dir=config.RUNS / ws.sandbox_id, agent_home=home)
-        plan = mounts.plan_for(ws, cfg, home)
         res = resources.ResourceConfig("1", "1g", "256", "5m", cfg)
-        backend = LocalDockerBackend()
+        plan = mounts.plan_for(ws, cfg, home, resources=res)
+        backend = probe_backend()
 
         def run(cmd):
             rec = RunRecord.load(ws.sandbox_id) or RunRecord(ws.sandbox_id)
@@ -378,18 +800,11 @@ def _sandbox_probe(cfg, with_quota=False):
             out = rec.stdout_log.read_text() if rec.stdout_log.exists() else ""
             return r, redact(out)
 
-        script1 = (
-            "echo x > probe && git add probe && git commit -qm probe && echo COMMIT_OK;"
-            " C=$(git rev-parse --path-format=absolute --git-common-dir);"
-            " (touch \"$C/hooks/doctor\" 2>/dev/null && echo HOOK_WRITABLE) || echo HOOK_RO;"
-            " git worktree prune && echo PRUNE_OK;"
-            " echo BRIDGE_TEMPLATE=$(PI_CODING_AGENT_DIR=/opt/agent-sandbox/pi-agent-template pi --list-models 2>/dev/null | grep -c claude-bridge);"
-            " echo BRIDGE_HOME=$(pi --list-models 2>/dev/null | grep -c claude-bridge);"
-            " mkdir -p /tmp/nocreds && G=$(CLAUDE_CONFIG_DIR=/tmp/nocreds claude -p hi --dangerously-skip-permissions 2>&1 | head -c 400);"
-            " case \"$G\" in *'cannot be used with root'*) echo GATE_CLOSED;; *'ot logged in'*|*'login'*|*'Login'*) echo GATE_OPEN;; *) echo \"GATE_UNKNOWN: $G\";; esac;"
-            " echo marker > /root/.claude/doctor-marker && echo MARKER_WRITTEN"
-        )
-        r1, out1 = run(script1)
+        r1, out1 = run(PROBE_SCRIPT)
+        checks.append(thread_env_check(out1, res.thread_env()))
+        settings = _settings_or_none(cfg)
+        if settings is not None:
+            checks.append(slice_cgroup_check(out1, settings, slice_cgroup_dir().exists()))
         ok = r1.status == "completed" and "COMMIT_OK" in out1
         on_host = subprocess.run(["git", "-C", str(ws.path), "log", "--oneline"],
                                  capture_output=True, text=True).stdout.count("\n")
@@ -453,6 +868,37 @@ def _sandbox_probe(cfg, with_quota=False):
                 pass
         shutil.rmtree(repo, ignore_errors=True)
     return checks
+
+
+_THREADS_LINE = re.compile(r"^THREADS=(.*)$", re.M)
+
+
+def thread_env_check(probe_output, expected):
+    """A container sees the thread caps plan_for merged into its env (R10).
+
+    Reads the `THREADS=a,b,c,d` line the sandbox probe echoes rather than
+    starting a container of its own; `expected` is the probe's
+    `ResourceConfig.thread_env()`. `None` output means the probe did not run.
+    """
+    name = "thread caps in container env"
+    want = [expected[k] for k in resources.ResourceConfig.THREAD_VARS]
+    if probe_output is None:
+        return Check(name, WARN, "probe not run",
+                     "Run `agent-sandbox doctor` without --quick, after `agent-sandbox build`.")
+    m = _THREADS_LINE.search(probe_output)
+    if not m:
+        return Check(name, FAIL, "the probe printed no THREADS line",
+                     "The probe container did not reach the env check; see the checks above.")
+    got = m.group(1).strip().split(",")
+    got += [""] * (len(want) - len(got))
+    wrong = [f"{k}={g or 'unset'} (want {w})"
+             for k, g, w in zip(resources.ResourceConfig.THREAD_VARS, got, want) if g != w]
+    if wrong:
+        return Check(name, FAIL, "; ".join(wrong),
+                     "mounts.plan_for merges ResourceConfig.thread_env() into the run env; "
+                     "a backend that drops plan.env loses these caps.")
+    return Check(name, PASS, ", ".join(f"{k}={w}" for k, w in
+                                       zip(resources.ResourceConfig.THREAD_VARS, want)))
 
 
 def _drift_checks():

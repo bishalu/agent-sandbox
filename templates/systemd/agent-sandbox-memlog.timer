@@ -1,0 +1,13 @@
+# Installed by `agent-sandbox memlog install`. A minute cadence: admission
+# treats a sample older than three minutes as stale (KTD5), so one missed
+# tick still leaves a fresh reading.
+[Unit]
+Description=agent-sandbox memory sample every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

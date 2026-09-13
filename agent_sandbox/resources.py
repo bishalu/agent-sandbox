@@ -46,29 +46,70 @@ def parse_memory(value):
 class ResourceConfig:
     """Resolved limits for one run."""
 
-    def __init__(self, cpus=None, memory=None, pids=None, timeout=None, cfg=None):
+    # Every managed container runs under this user slice when admission is on,
+    # so the slice's MemoryMax holds the budget continuously (KTD8).
+    SLICE = "agent-sandbox.slice"
+
+    def __init__(self, cpus=None, memory=None, pids=None, timeout=None, cfg=None,
+                 memory_swap=None):
         cfg = config.load_config() if cfg is None else cfg
         self.cpus = str(config.resolve("cpus", cpus, cfg))
-        self.memory = str(config.resolve("memory", memory, cfg))
+        self.memory, self.memory_source = config.resolve_source("memory", memory, cfg)
+        self.memory = str(self.memory)
         self.pids = int(config.resolve("pids", pids, cfg))
         self.timeout_raw = str(config.resolve("timeout", timeout, cfg))
         self.timeout = parse_duration(self.timeout_raw)
+        # Swap allowance defaults to the memory limit itself: no swap (KTD8).
+        swap = config.resolve("memory_swap", memory_swap, cfg)
+        self.memory_swap = str(swap) if swap is not None else self.memory
+        self.cgroup_parent = (self.SLICE
+                              if config.as_bool(config.resolve("admission_enabled", None, cfg))
+                              else None)
         # Validate eagerly so a bad value fails before a container is created.
         float(self.cpus)
         self.memory_bytes = parse_memory(self.memory)
+        if self.memory_swap != "-1":
+            parse_memory(self.memory_swap)
+
+    # Compute libraries default to one thread per host core, which inside a
+    # --cpus limited container means N threads fighting over a fraction of a
+    # core each. Four is where the libraries stop scaling on this workload
+    # anyway (KTD6).
+    THREAD_CAP = 4
+    THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                   "MKL_NUM_THREADS", "AGENT_SANDBOX_THREADS")
+
+    def thread_env(self):
+        """Thread caps for compute libraries, derived from the CPU limit (R10).
+
+        `min(cpus, 4)`, floored to whole threads and never below one. The
+        three standard variables cover OpenMP, OpenBLAS and MKL;
+        `AGENT_SANDBOX_THREADS` is the documented handle for libraries that
+        read no standard variable (onnxruntime), so a project sets its own
+        thread count from it. `AGENT_SANDBOX_CPUS` keeps its existing meaning
+        as the host-side CPU override (SPEC R-03).
+        """
+        n = max(1, min(int(float(self.cpus)), self.THREAD_CAP))
+        return {k: str(n) for k in self.THREAD_VARS}
 
     def docker_args(self):
-        return [
+        args = [
             "--cpus", self.cpus,
             "--memory", self.memory,
+            "--memory-swap", self.memory_swap,
             "--pids-limit", str(self.pids),
         ]
+        if self.cgroup_parent:
+            args.append(f"--cgroup-parent={self.cgroup_parent}")
+        return args
 
     def to_dict(self):
         return {
             "cpus": self.cpus,
             "memory": self.memory,
             "memory_bytes": self.memory_bytes,
+            "memory_swap": self.memory_swap,
+            "cgroup_parent": self.cgroup_parent,
             "pids": self.pids,
             "timeout": self.timeout_raw,
             "timeout_seconds": self.timeout,

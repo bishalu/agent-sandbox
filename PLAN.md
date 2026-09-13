@@ -230,6 +230,30 @@ terminal, `--new` skips the lookup. Motivation: `agent-sandbox .` after a
 pause created a second sandbox with an empty agent home, and the engineer
 could not find their conversations.
 
+## M11 — v1.3: milestone run hardening (admission, state, doctor, chaos)
+
+Verification checklist for the admission, memlog, state and doctor work
+(plan: `docs/plans/2026-09-13-1610-feat-milestone-run-hardening-plan.md`):
+
+1. pure logic: `uv run --with pytest python3 -m pytest tests/ -q` green from
+   the repo root (admission math, state derivation, memlog parsing, locks,
+   and the five doctor checks in `tests/test_doctor_checks.py`, every
+   reading injected)
+2. `agent-sandbox doctor --quick` shows the host-side rows `admission config`,
+   `stale running entries`, `project locks`, `slice memory.max`, and
+   `slice cgroup parent` as WARN "probe not run"; `agent-sandbox doctor`
+   (no `--quick`) runs the sandbox probe under the `force` admission path and
+   fills `slice cgroup parent` and `thread caps in container env` from its
+   output; every FAIL row carries a remedy
+3. `scripts/chaos-check.sh` exits 0 and prints PASS: a second launch refused
+   with exit 3 and numbers, the container surviving its launching shell,
+   `status` deriving crashed after a simulated crash, `resume` naming the
+   finishing command. It launches containers, so it runs only when doctor's
+   `host disk` row passes (the script checks this itself and aborts otherwise)
+
+Recorded with the command and observed output in the plan's verification
+contract, the way M6 records in REVIEW.md.
+
 ## Risks
 
 | Risk | Mitigation |

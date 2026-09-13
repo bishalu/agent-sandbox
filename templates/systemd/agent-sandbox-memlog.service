@@ -1,0 +1,8 @@
+# Installed by `agent-sandbox memlog install`. One sample per activation;
+# the timer next to it decides the cadence. The bin path is filled in at install.
+[Unit]
+Description=agent-sandbox memory sample (host and per-container)
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@ memlog sample
