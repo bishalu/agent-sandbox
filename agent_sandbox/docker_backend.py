@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 
-from . import config, mounts
+from . import admission, config, mounts
 from .backend import SandboxBackend, SandboxResult
 from .errors import DockerUnavailable, NotImplementedYet, RootfulDockerRefused
 
@@ -38,8 +38,13 @@ VALID_NETWORKS = ("full", "none", "restricted")
 class LocalDockerBackend(SandboxBackend):
     name = "local-docker"
 
-    def __init__(self, strict_caps=False):
+    def __init__(self, strict_caps=False, force_admission=False, wait=True):
         self.strict_caps = strict_caps
+        # Admission (KTD1) is decided here, per run, so every library caller
+        # passes through it; `force_admission` is the documented bypass that
+        # doctor's probe uses, `wait=False` turns a wait into a refusal.
+        self.force_admission = force_admission
+        self.wait = wait
         self._env = config.docker_env()
 
     # -- environment checks ---------------------------------------------
@@ -78,6 +83,16 @@ class LocalDockerBackend(SandboxBackend):
     def runtime_available(self, runtime):
         p = self._docker(["info", "--format", "{{json .Runtimes}}"])
         return p.returncode == 0 and f'"{runtime}"' in p.stdout
+
+    def container_exists(self, name):
+        return self._docker(["inspect", "--format", "{{.Id}}", name]).returncode == 0
+
+    @staticmethod
+    def _size(path):
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
 
     # -- argv construction ----------------------------------------------
     def build_args(self, spec, container_name):
@@ -189,9 +204,20 @@ class LocalDockerBackend(SandboxBackend):
         rec = spec.record
         started = time.time()
         if rec:
+            # The launching pid and this entry's start offset in the shared
+            # stdout.log let a later reconciliation tell orphaned from running
+            # and scan only this entry's own output (KTD4).
             rec.add_container(container_name,
                               "runsc" if spec.experimental_gvisor else "runc",
-                              spec.command or ["bash", "-l"])
+                              spec.command or ["bash", "-l"],
+                              pid=os.getpid(),
+                              stdout_offset_start=self._size(rec.stdout_log))
+        # Admission (KTD1): decided here, after image, home and mounts are
+        # ready, so the window between the decision and the container's
+        # existence is this function's own. None when admission is off.
+        admitted = admission.acquire(spec, force=self.force_admission, wait=self.wait,
+                                     quiet=not spec.stream_output)
+        if rec:
             rec.start().save()
 
         timeout = spec.resources.timeout
@@ -220,6 +246,8 @@ class LocalDockerBackend(SandboxBackend):
                     timer.daemon = True
                     timer.start()
                 proc = subprocess.Popen(["docker"] + args, env=self._env)
+                if admitted:
+                    admitted.release_when_visible(container_name, self.container_exists)
                 exit_code = proc.wait()
             else:
                 # Non-interactive: tee to the terminal and to the run logs (R-09).
@@ -234,6 +262,8 @@ class LocalDockerBackend(SandboxBackend):
                     ["docker"] + args, env=self._env,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
+                if admitted:
+                    admitted.release_when_visible(container_name, self.container_exists)
                 if timeout:
                     timer = threading.Timer(timeout, _kill)
                     timer.daemon = True
@@ -273,13 +303,18 @@ class LocalDockerBackend(SandboxBackend):
         finally:
             if timer:
                 timer.cancel()
+            if admitted:
+                # Both locks: the flock if the watcher has not dropped it yet,
+                # and the project lock this run held for its whole life (KTD2).
+                admitted.release()
 
         status = "timed_out" if timed_out["hit"] else (
             "completed" if exit_code == 0 else "failed")
         finished = time.time()
 
         if rec:
-            rec.finish_container(exit_code, status)
+            rec.finish_container(exit_code, status,
+                                 stdout_offset_end=self._size(rec.stdout_log))
             rec.finish(exit_code, status).save()
 
         # Ephemeral: --rm removes it. Sweep defensively in case of a crash.

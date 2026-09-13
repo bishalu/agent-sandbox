@@ -14,14 +14,17 @@ import pathlib
 import re
 import sys
 
-from . import (agent_home, cleanup, config, credentials, doctor, gitdir, memlog,
-               plugins, image, mounts, resources, worktree)
+from . import (admission, agent_home, cleanup, config, credentials, doctor, gitdir,
+               memlog, plugins, image, mounts, resources, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
-from .errors import SandboxError
+from .errors import AdmissionRefused, AdmissionTimeout, SandboxError
 from .metadata import RunRecord
 
 PROG = "agent-sandbox"
+# A launch that admission refused or timed out (R2). Distinct from 1 so a
+# driver can tell "wait and retry" from "broken".
+EXIT_ADMISSION = 3
 
 
 # ---------------------------------------------------------------- helpers
@@ -37,6 +40,30 @@ def _fail(err):
         for line in str(remedy).splitlines():
             _eprint(f"  → {line}")
     return 1
+
+
+def _fail_admission(err, as_json):
+    """Exit 3 with the reasons and numbers, as one JSON object under --json."""
+    if as_json:
+        print(json.dumps({"admission": err.kind, "message": err.message,
+                          "reasons": err.reasons, "numbers": err.decision.numbers,
+                          "remedy": err.remedy}, indent=2))
+    else:
+        _fail(err)
+    return EXIT_ADMISSION
+
+
+def _parse_tags(items):
+    """`--tag key=value`, repeatable, into a dict. The driver tags each run
+    with its unit and milestone; `milestone` also selects the project lock."""
+    tags = {}
+    for item in items or []:
+        key, eq, value = item.partition("=")
+        if not eq or not key.strip():
+            raise SandboxError(f"--tag needs key=value, got {item!r}",
+                               "Example: --tag unit=milestone-app-6 --tag milestone=6")
+        tags[key.strip()] = value
+    return tags
 
 
 def _split_command(argv):
@@ -149,7 +176,9 @@ def cmd_run(args, command):
 
     # Nothing is created before the backend proves it can run: a Docker
     # outage must not leave an orphan worktree and branch behind (R-20).
-    backend = LocalDockerBackend(strict_caps=args.strict_caps)
+    tags = _parse_tags(args.tag)
+    backend = LocalDockerBackend(strict_caps=args.strict_caps,
+                                 force_admission=args.force, wait=args.wait)
     backend.preflight()
     mounts.skill_mounts(cfg)            # config errors surface before anything exists
     if not args.direct:
@@ -166,7 +195,7 @@ def cmd_run(args, command):
     # credentials, mount planning) must leave a sandbox that `list` and `rm`
     # can see, never an invisible worktree and branch (R-20).
     rec.update(repo=ws.repo, workspace=str(ws.path), workspace_kind=ws.kind,
-               branch=ws.branch).save()
+               branch=ws.branch, tags=tags).save()
 
     try:
         # Gitignored secrets the repo keeps beside its code (R-23). Done first:
@@ -281,8 +310,10 @@ def cmd_enter(args, command):
     mode = config.resolve("mode", args.mode, cfg)
     network = config.resolve("network", args.network, cfg)
     img = config.resolve("image", args.image, cfg)
+    tags = _parse_tags(args.tag)
 
-    backend = LocalDockerBackend(strict_caps=args.strict_caps)
+    backend = LocalDockerBackend(strict_caps=args.strict_caps,
+                                 force_admission=args.force, wait=args.wait)
     backend.preflight()
     image.ensure(img, quiet=bool(args.json))
 
@@ -304,7 +335,7 @@ def cmd_enter(args, command):
     )
     plan = mounts.plan_for(ws, cfg, home)
     rec.update(resources=res.to_dict(), credentials=creds.to_dict(),
-               mode=mode, network=network, image=img,
+               mode=mode, network=network, image=img, tags=tags,
                agent_home=str(home.path),
                mounts=[m.to_dict() for m in plan.mounts],
                trusted_mounts=[m.to_dict() for m in plan.trusted]).save()
@@ -449,12 +480,73 @@ def cmd_config(args):
         if not args.key or args.value is None:
             _eprint(f"{PROG}: usage: {PROG} config set <key> <value>")
             return 1
-        val = args.value
-        if val.isdigit():
-            val = int(val)
-        cfg[args.key] = val
+        val = config.parse_value(args.value)
+        if val is None:
+            cfg.pop(args.key, None)          # `null` restores the default
+        else:
+            cfg[args.key] = val
         config.save_config(cfg)
-        print(f"{args.key} = {val}")
+        print(f"{args.key} = {val if isinstance(val, str) else json.dumps(val)}")
+        return 0
+    return 1
+
+
+# ---------------------------------------------------------------- admission
+def cmd_admission(args):
+    cfg = config.load_config()
+    settings = admission.resolve_settings(cfg)
+    if args.action == "install":
+        config.ensure_dirs()
+        state = admission.install(settings.budget)
+        if args.json:
+            print(json.dumps(state, indent=2))
+        else:
+            print(f"{state['slice']} MemoryMax={admission.fmt(state['memory_max'])} "
+                  f"({settings.sources['budget']} budget); recorded in {admission.state_file()}")
+            if not settings.enabled:
+                print(f"admission is off; enable it with: {PROG} config set admission_enabled true")
+        return 0
+    if args.action == "show":
+        # The same readings a launch takes, decided for the default request,
+        # so a refusal can be understood without launching anything.
+        res = resources.ResourceConfig(cfg=cfg)
+        fresh = admission.read_memlog(settings)
+        rows = admission.inspect_running()
+        committed = admission.committed_memory(rows, fresh.sample, settings.budget)
+        try:
+            avail = admission.read_mem_available()
+        except (OSError, ValueError):
+            avail = 0
+        # `show` always decides, even when admission is off, so the numbers
+        # are visible before a host turns it on.
+        live = dataclasses.replace(settings, enabled=True)
+        d = admission.decide(res.memory_bytes, committed, avail, fresh, None, live,
+                             request_source=res.memory_source)
+        state = admission.read_state()
+        if args.json:
+            print(json.dumps({"enabled": settings.enabled, "sources": settings.sources,
+                              "wait_timeout_s": settings.wait_timeout_s,
+                              "wait_interval_s": settings.wait_interval_s,
+                              "containers": rows, "memlog": {"fresh": fresh.fresh,
+                                                             "reason": fresh.reason,
+                                                             "age_s": fresh.age_s},
+                              "decision": d.to_dict(), "slice": state}, indent=2))
+        else:
+            print(f"admission {'enabled' if settings.enabled else 'DISABLED'} "
+                  f"({settings.sources['enabled']}); {admission.describe(d)}")
+            for r in rows:
+                lim = admission.fmt(r["memory_limit"]) if r["memory_limit"] else "unlimited"
+                used = (fresh.sample.containers.get(r["name"]) if fresh.sample else None)
+                print(f"  {r['name']}: limit {lim}"
+                      + (f", using {admission.fmt(used)}" if used is not None else ""))
+            print(f"memory log: {'fresh' if fresh.fresh else 'STALE: ' + fresh.reason}")
+            if state:
+                print(f"slice {state['slice']}: MemoryMax={admission.fmt(state['memory_max'])} "
+                      f"set {state['set_at']}" + ("" if state["ok"] else " (FAILED)"))
+            else:
+                print(f"slice not set: {PROG} admission install")
+            print(f"a default run ({admission.fmt(res.memory_bytes)}) would: {d.verdict}"
+                  + (f" ({'; '.join(d.reasons)})" if d.reasons else ""))
         return 0
     return 1
 
@@ -571,6 +663,16 @@ def build_parser():
                         help="run under gVisor; forfeits enforced resource limits")
         sp.add_argument("--image")
         sp.add_argument("--json", action="store_true")
+        sp.add_argument("--tag", action="append", metavar="KEY=VALUE", default=[],
+                        help="label this run (repeatable); `milestone=<n>` also takes "
+                             "the project's milestone lock")
+        wait = sp.add_mutually_exclusive_group()
+        wait.add_argument("--wait", dest="wait", action="store_true", default=True,
+                          help="wait for admission headroom (the default)")
+        wait.add_argument("--no-wait", dest="wait", action="store_false",
+                          help="fail at once instead of waiting for headroom")
+        sp.add_argument("--force", action="store_true",
+                        help="bypass admission control for this run")
         # Worktrees persist by default (R-04). --rm opts into disposing of the
         # workspace on a clean exit; it never discards work after a failure.
         keep = sp.add_mutually_exclusive_group()
@@ -628,6 +730,12 @@ def build_parser():
     sp.add_argument("key", nargs="?")
     sp.add_argument("value", nargs="?")
 
+    sp = sub.add_parser("admission", help="the memory budget launches are admitted under")
+    sp.add_argument("action", choices=["install", "show"],
+                    help="install: cap the agent-sandbox.slice at the budget; "
+                         "show: the effective numbers and what a run would get")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("memlog", help="the per-minute memory log launches depend on")
     sp.add_argument("action", choices=["install", "sample", "show"],
                     help="install: enable the systemd --user timer; sample: append one "
@@ -642,7 +750,8 @@ def build_parser():
     return p
 
 
-KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config", "memlog"}
+KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config", "memlog",
+         "admission"}
 
 
 def main(argv=None):
@@ -680,6 +789,10 @@ def main(argv=None):
             return cmd_config(args)
         if args.cmd == "memlog":
             return cmd_memlog(args)
+        if args.cmd == "admission":
+            return cmd_admission(args)
+    except (AdmissionRefused, AdmissionTimeout) as e:
+        return _fail_admission(e, getattr(args, "json", False))
     except SandboxError as e:
         return _fail(e)
     except KeyboardInterrupt:

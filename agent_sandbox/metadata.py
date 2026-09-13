@@ -38,6 +38,8 @@ class RunRecord:
             "agent_home": None,        # runs/<id>/agent-home (R-18)
             "mounts": [],              # every declared bind mount (R-16)
             "trusted_mounts": [],      # the git common-dir set, rw into host state (R-20)
+            "tags": {},                # --tag key=value, e.g. unit and milestone
+            "admission": None,         # the effective numbers and sources (R4)
             "containers": [],
             "started_at": None,
             "finished_at": None,
@@ -104,30 +106,54 @@ class RunRecord:
         self.data.update(kw)
         return self
 
-    def add_container(self, container_id, runtime, command, status="running"):
-        """A sandbox id can outlive many containers (enter / re-run)."""
+    def add_container(self, container_id, runtime, command, status="running",
+                      pid=None, stdout_offset_start=None):
+        """A sandbox id can outlive many containers (enter / re-run).
+
+        `pid` is the launching process, so a later reconciliation can tell an
+        orphaned container (up, launcher gone) from a running one; the stdout
+        offsets bound this entry's own segment of the shared stdout.log.
+        """
         self.data.setdefault("containers", []).append({
             "container": container_id,
             "runtime": runtime,
             "command": command,
+            "pid": pid,
             "started_at": _now(),
+            "waiting_since": None,
             "finished_at": None,
             "exit_code": None,
             "status": status,
+            "stdout_offset_start": stdout_offset_start,
+            "stdout_offset_end": None,
         })
         return self
 
-    def finish_container(self, exit_code, status):
+    def finish_container(self, exit_code, status, stdout_offset_end=None):
         if self.data.get("containers"):
             c = self.data["containers"][-1]
             c["finished_at"] = _now()
             c["exit_code"] = exit_code
             c["status"] = status
+            if stdout_offset_end is not None:
+                c["stdout_offset_end"] = stdout_offset_end
+        return self
+
+    def wait(self):
+        """Admission is holding this launch: visible as waiting, not as
+        running or vanished (KTD1)."""
+        self.data["status"] = "waiting"
+        if self.data.get("containers"):
+            c = self.data["containers"][-1]
+            c["status"] = "waiting"
+            c["waiting_since"] = c.get("waiting_since") or _now()
         return self
 
     def start(self):
         self.data["started_at"] = _now()
         self.data["status"] = "running"
+        if self.data.get("containers") and self.data["containers"][-1].get("status") == "waiting":
+            self.data["containers"][-1]["status"] = "running"
         return self
 
     def finish(self, exit_code, status):
@@ -157,6 +183,8 @@ class RunRecord:
             "agent_home": d.get("agent_home"),
             "mounts": d.get("mounts") or [],
             "trusted_mounts": d.get("trusted_mounts") or [],
+            "tags": d.get("tags") or {},
+            "admission": d.get("admission"),
             "command": d.get("command"),
             "exit_code": d.get("exit_code"),
             "status": d.get("status"),

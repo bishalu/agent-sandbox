@@ -57,3 +57,37 @@ class MountError(SandboxError):
     """A declared bind mount cannot be honored: missing source, bad config,
     or an unresolvable git identity. One class for every mount failure; the
     message and remedy carry the specifics."""
+
+
+class AdmissionRefused(SandboxError):
+    """Admission said no and waiting would not help: the request exceeds the
+    whole budget, the memory log is stale, or the caller asked not to wait.
+    Carries the `Decision` so the CLI can emit its numbers as JSON."""
+
+    kind = "refused"
+
+    def __init__(self, decision, remedy=None):
+        self.decision = decision
+        self.reasons = list(decision.reasons)
+        super().__init__(
+            "admission refused: " + "; ".join(self.reasons),
+            remedy or ("Lower --memory, stop a running container, or refresh the "
+                       "memory log (`agent-sandbox memlog show`). `--force` bypasses "
+                       "admission; `agent-sandbox admission show` prints the numbers."))
+
+
+class AdmissionTimeout(SandboxError):
+    """Waited the configured time for headroom, the floor or the project lock
+    and never got it. Carries the last `Decision`."""
+
+    kind = "timeout"
+
+    def __init__(self, decision, waited_s, remedy=None):
+        self.decision = decision
+        self.reasons = list(decision.reasons)
+        self.waited_s = waited_s
+        super().__init__(
+            f"admission timed out after {int(waited_s)} s: " + "; ".join(self.reasons),
+            remedy or ("Wait for the running containers to finish, raise "
+                       "admission_wait_timeout_s, or lower --memory. "
+                       "`agent-sandbox admission show` prints the live numbers."))

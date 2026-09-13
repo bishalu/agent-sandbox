@@ -46,29 +46,49 @@ def parse_memory(value):
 class ResourceConfig:
     """Resolved limits for one run."""
 
-    def __init__(self, cpus=None, memory=None, pids=None, timeout=None, cfg=None):
+    # Every managed container runs under this user slice when admission is on,
+    # so the slice's MemoryMax holds the budget continuously (KTD8).
+    SLICE = "agent-sandbox.slice"
+
+    def __init__(self, cpus=None, memory=None, pids=None, timeout=None, cfg=None,
+                 memory_swap=None):
         cfg = config.load_config() if cfg is None else cfg
         self.cpus = str(config.resolve("cpus", cpus, cfg))
-        self.memory = str(config.resolve("memory", memory, cfg))
+        self.memory, self.memory_source = config.resolve_source("memory", memory, cfg)
+        self.memory = str(self.memory)
         self.pids = int(config.resolve("pids", pids, cfg))
         self.timeout_raw = str(config.resolve("timeout", timeout, cfg))
         self.timeout = parse_duration(self.timeout_raw)
+        # Swap allowance defaults to the memory limit itself: no swap (KTD8).
+        swap = config.resolve("memory_swap", memory_swap, cfg)
+        self.memory_swap = str(swap) if swap is not None else self.memory
+        self.cgroup_parent = (self.SLICE
+                              if config.as_bool(config.resolve("admission_enabled", None, cfg))
+                              else None)
         # Validate eagerly so a bad value fails before a container is created.
         float(self.cpus)
         self.memory_bytes = parse_memory(self.memory)
+        if self.memory_swap != "-1":
+            parse_memory(self.memory_swap)
 
     def docker_args(self):
-        return [
+        args = [
             "--cpus", self.cpus,
             "--memory", self.memory,
+            "--memory-swap", self.memory_swap,
             "--pids-limit", str(self.pids),
         ]
+        if self.cgroup_parent:
+            args.append(f"--cgroup-parent={self.cgroup_parent}")
+        return args
 
     def to_dict(self):
         return {
             "cpus": self.cpus,
             "memory": self.memory,
             "memory_bytes": self.memory_bytes,
+            "memory_swap": self.memory_swap,
+            "cgroup_parent": self.cgroup_parent,
             "pids": self.pids,
             "timeout": self.timeout_raw,
             "timeout_seconds": self.timeout,

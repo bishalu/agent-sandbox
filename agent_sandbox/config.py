@@ -61,6 +61,17 @@ DEFAULTS = {
     # sample is older than this many seconds by the monotonic clock. Three
     # missed one-minute ticks; the timer's own cadence is not configurable.
     "admission_memlog_max_age_s": 180,
+    # Admission control (R1, KTD1): off by default so SPEC R-13 (no global
+    # locking) stays true unless a host opts in. The budget counts every
+    # running container's limit; the floor is MemAvailable the host keeps.
+    "admission_enabled": False,
+    "admission_memory_budget": "32g",
+    "admission_mem_floor_gb": 8,
+    "admission_wait_timeout_s": 1800,
+    "admission_wait_interval_s": 30,
+    # Swap allowance per container; None means "equal to memory", so a
+    # container cannot spill into the VM's swap (KTD8).
+    "memory_swap": None,
 }
 
 _ENV = {
@@ -72,7 +83,16 @@ _ENV = {
     "network": "AGENT_SANDBOX_NETWORK",
     "image": "AGENT_SANDBOX_IMAGE",
     "admission_memlog_max_age_s": "AGENT_SANDBOX_ADMISSION_MEMLOG_MAX_AGE_S",
+    "admission_enabled": "AGENT_SANDBOX_ADMISSION_ENABLED",
+    "admission_memory_budget": "AGENT_SANDBOX_ADMISSION_MEMORY_BUDGET",
+    "admission_mem_floor_gb": "AGENT_SANDBOX_ADMISSION_MEM_FLOOR_GB",
+    "admission_wait_timeout_s": "AGENT_SANDBOX_ADMISSION_WAIT_TIMEOUT_S",
+    "admission_wait_interval_s": "AGENT_SANDBOX_ADMISSION_WAIT_INTERVAL_S",
+    "memory_swap": "AGENT_SANDBOX_MEMORY_SWAP",
 }
+
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off", ""}
 
 
 def ensure_dirs():
@@ -100,17 +120,51 @@ def save_config(data):
     tmp.replace(CONFIG_FILE)
 
 
-def resolve(key, flag_value=None, config=None):
-    """flag > env > config.json > built-in default."""
+def resolve_source(key, flag_value=None, config=None):
+    """(value, tier) with tier one of flag, env, config, default: the same
+    ladder as `resolve`, keeping the tier so R4 can say where a number came from."""
     if flag_value is not None:
-        return flag_value
+        return flag_value, "flag"
     env_name = _ENV.get(key)
     if env_name and os.environ.get(env_name):
-        return os.environ[env_name]
+        return os.environ[env_name], "env"
     cfg = load_config() if config is None else config
     if key in cfg and cfg[key] is not None:
-        return cfg[key]
-    return DEFAULTS.get(key)
+        return cfg[key], "config"
+    return DEFAULTS.get(key), "default"
+
+
+def resolve(key, flag_value=None, config=None):
+    """flag > env > config.json > built-in default."""
+    return resolve_source(key, flag_value, config)[0]
+
+
+def as_bool(value):
+    """Booleans arrive as JSON booleans from config.json and as strings from
+    the environment; both must read the same way."""
+    if isinstance(value, bool) or value is None:
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    raise ValueError(f"not a boolean: {value!r}")
+
+
+def parse_value(text):
+    """How `config set` reads a value: true/false/null and integers become
+    themselves, anything else stays a string. None means "unset the key"."""
+    low = text.strip().lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low == "null":
+        return None
+    if text.isdigit():
+        return int(text)
+    return text
 
 
 def docker_env():

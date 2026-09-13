@@ -8,7 +8,6 @@ Central storage keeps the source repo untouched.
 """
 
 import hashlib
-import os
 import pathlib
 import re
 import secrets
@@ -17,6 +16,7 @@ import subprocess
 
 from . import config
 from .errors import LockHeld, RepoError, WorktreeError
+from .locks import PidLock
 
 _SLUG = re.compile(r"[^a-z0-9]+")
 
@@ -96,56 +96,26 @@ class Workspace:
             self.lock.release()
 
 
-class DirectLock:
+class DirectLock(PidLock):
     """Advisory per-repo lock, only for --direct (R-04).
 
     Worktree mode needs no lock: separate worktrees cannot race. --direct
     mutates the live checkout, so two concurrent runs genuinely conflict.
+    The stale-holder rule lives in `locks.PidLock`.
     """
 
     def __init__(self, repo):
         h = hashlib.sha256(str(repo).encode()).hexdigest()[:16]
-        self.path = config.LOCK_DIR / f"{h}.lock"
+        super().__init__(config.LOCK_DIR / f"{h}.lock", note=str(repo))
         self.repo = str(repo)
 
-    def _stale(self):
-        try:
-            pid = int(self.path.read_text().split()[0])
-        except (ValueError, OSError, IndexError):
-            return True
-        if pid == os.getpid():
-            return True
-        try:
-            os.kill(pid, 0)          # signal 0 only tests existence
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            return False             # exists, owned by someone else
-        return False
-
-    def acquire(self):
-        config.LOCK_DIR.mkdir(parents=True, exist_ok=True)
-        if self.path.exists() and not self._stale():
-            holder = self.path.read_text().strip()
-            raise LockHeld(
-                f"another --direct sandbox is already running against {self.repo}\n"
-                f"  lock: {self.path} ({holder})",
-                "Wait for it to finish, or drop --direct to use an isolated "
-                "worktree instead (worktree runs never conflict).",
-            )
-        if self.path.exists():
-            self.path.unlink()       # reclaim stale
-        self.path.write_text(f"{os.getpid()} {self.repo}\n")
-        return self
-
-    def release(self):
-        try:
-            if self.path.exists():
-                pid = int(self.path.read_text().split()[0])
-                if pid == os.getpid():
-                    self.path.unlink()
-        except (ValueError, OSError, IndexError):
-            pass
+    def _held_error(self, holder):
+        return LockHeld(
+            f"another --direct sandbox is already running against {self.repo}\n"
+            f"  lock: {self.path} ({holder})",
+            "Wait for it to finish, or drop --direct to use an isolated "
+            "worktree instead (worktree runs never conflict).",
+        )
 
 
 def create(target, sandbox_id=None, direct=False):
