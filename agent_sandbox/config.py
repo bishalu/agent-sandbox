@@ -178,6 +178,19 @@ def host_disk_path_source(cfg=None, read_version=None):
     return (WSL_HOST_DISK if "microsoft" in version.lower() else "/"), "auto"
 
 
+CGROUP_USER_SLICE = pathlib.Path("/sys/fs/cgroup/user.slice")
+
+
+def user_manager_cgroup(*parts, uid=None):
+    """A path under this user's systemd user manager in the cgroup v2 tree:
+    /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/<parts>.
+    Rootless Docker's container scopes, the delegated controllers file and
+    agent-sandbox.slice all live there; this is the one place the shape is
+    spelled out."""
+    uid = UID if uid is None else uid
+    return CGROUP_USER_SLICE.joinpath(f"user-{uid}.slice", f"user@{uid}.service", *parts)
+
+
 def as_bool(value):
     """Booleans arrive as JSON booleans from config.json and as strings from
     the environment; both must read the same way."""

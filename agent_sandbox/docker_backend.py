@@ -217,8 +217,6 @@ class LocalDockerBackend(SandboxBackend):
         # existence is this function's own. None when admission is off.
         admitted = admission.acquire(spec, force=self.force_admission, wait=self.wait,
                                      quiet=not spec.stream_output)
-        if rec:
-            rec.start().save()
 
         timeout = spec.resources.timeout
         timer = None
@@ -238,6 +236,10 @@ class LocalDockerBackend(SandboxBackend):
                            env=self._env, capture_output=True, text=True)
 
         try:
+            # Inside the try, so a failed record write cannot leak the flock
+            # and project lock `acquire` just handed us.
+            if rec:
+                rec.start().save()
             if spec.interactive:
                 # Interactive: hand the terminal straight to the container.
                 # Output is the user's session, not a captured log.

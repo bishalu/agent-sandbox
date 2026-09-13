@@ -176,7 +176,7 @@ def test_sample_reads_both_containers_from_the_cgroup_tree(tmp_path):
         log, read_boot_id=lambda: BOOT, read_monotonic=lambda: 1234.5,
         read_meminfo=lambda: meminfo_text(),
         docker_ps=lambda: [("a" * 64, "alpha"), ("b" * 64, "beta")],
-        cgroup_root=root, docker_stats=stats,
+        cgroup_roots=[root], docker_stats=stats,
         now=lambda: "2026-09-13T16:00:00+00:00")
     f = memlog.parse_last_sample(log, BOOT, 1240.0, max_age_s=180)
     assert f.fresh
@@ -187,6 +187,32 @@ def test_sample_reads_both_containers_from_the_cgroup_tree(tmp_path):
     assert stats_calls == []             # the slow path was not taken
 
 
+def test_container_memory_finds_a_scope_under_the_admission_slice(tmp_path):
+    # With admission on, the scope lives under agent-sandbox.slice, not
+    # user.slice; the fast path must look there before paying for docker stats.
+    user_root = tmp_path / "user.slice"
+    user_root.mkdir()
+    slice_root = fake_cgroup(tmp_path, {"a" * 64: 100})
+    stats_calls = []
+
+    def stats():
+        stats_calls.append(1)
+        return {}
+
+    got = memlog.container_memory([("a" * 64, "alpha")], cgroup_roots=[user_root, slice_root],
+                                  docker_stats=stats)
+    assert got == {"alpha": 100}
+    assert stats_calls == []
+
+
+def test_default_cgroup_roots_are_user_slice_then_the_admission_slice():
+    from agent_sandbox.resources import ResourceConfig
+    assert memlog.CGROUP_ROOTS == (config.user_manager_cgroup("user.slice"),
+                                   config.user_manager_cgroup(ResourceConfig.SLICE))
+    assert memlog.SLICE_CGROUP_ROOT.name == "agent-sandbox.slice"
+    assert memlog.SLICE_CGROUP_ROOT.parent.name == f"user@{config.UID}.service"
+
+
 def test_sample_falls_back_to_docker_stats_when_a_directory_is_missing(tmp_path):
     root = fake_cgroup(tmp_path, {"a" * 64: 100})
     log = tmp_path / "memory.log"
@@ -194,7 +220,7 @@ def test_sample_falls_back_to_docker_stats_when_a_directory_is_missing(tmp_path)
         log, read_boot_id=lambda: BOOT, read_monotonic=lambda: 1.0,
         read_meminfo=lambda: meminfo_text(),
         docker_ps=lambda: [("a" * 64, "alpha"), ("c" * 64, "gamma")],
-        cgroup_root=root, docker_stats=lambda: {"gamma": 999, "alpha": 1},
+        cgroup_roots=[root], docker_stats=lambda: {"gamma": 999, "alpha": 1},
         now=lambda: "t")
     f = memlog.parse_last_sample(log, BOOT, 2.0, max_age_s=180)
     assert f.sample.containers == {"alpha": 100, "gamma": 999}
@@ -204,7 +230,7 @@ def test_sample_appends_and_rotates(tmp_path):
     log = tmp_path / "memory.log"
     kw = dict(read_boot_id=lambda: BOOT, read_monotonic=lambda: 1.0,
               read_meminfo=lambda: meminfo_text(), docker_ps=lambda: [],
-              cgroup_root=tmp_path / "nope", docker_stats=lambda: {},
+              cgroup_roots=[tmp_path / "nope"], docker_stats=lambda: {},
               now=lambda: "t")
     memlog.sample(log, **kw)
     memlog.sample(log, **kw)
@@ -218,7 +244,7 @@ def test_sample_with_no_containers_writes_a_parseable_line(tmp_path):
     log = tmp_path / "memory.log"
     memlog.sample(log, read_boot_id=lambda: BOOT, read_monotonic=lambda: 1.0,
                   read_meminfo=lambda: meminfo_text(), docker_ps=lambda: [],
-                  cgroup_root=tmp_path / "nope", docker_stats=lambda: {},
+                  cgroup_roots=[tmp_path / "nope"], docker_stats=lambda: {},
                   now=lambda: "t")
     f = memlog.parse_last_sample(log, BOOT, 2.0, max_age_s=180)
     assert f.fresh and f.sample.containers == {}

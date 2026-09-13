@@ -95,8 +95,7 @@ def run_checks(quick=False, with_quota=False):
     ))
 
     # --- cgroup v2 delegation ---
-    cg = pathlib.Path("/sys/fs/cgroup/user.slice") / f"user-{os.getuid()}.slice" / \
-        f"user@{os.getuid()}.service" / "cgroup.controllers"
+    cg = config.user_manager_cgroup("cgroup.controllers")
     delegated = cg.read_text().split() if cg.exists() else []
     need = {"cpu", "memory", "pids"}
     ok = need.issubset(set(delegated))
@@ -354,21 +353,7 @@ def _host_checks(cfg):
     # --- memory log (R8, KTD5): the timer runs and the last sample is fresh ---
     # A launch fails closed on this log, so a stopped timer or a stale line
     # is a failed launch waiting to happen, not a warning.
-    active, fresh = memlog.health(cfg)
-    ok = active and fresh.fresh
-    if active and fresh.fresh:
-        detail = f"timer active, last sample {fresh.age_s:.0f} s old"
-    elif active:
-        detail = f"timer active but {fresh.reason}"
-    else:
-        detail = f"timer inactive; {fresh.reason}" if not fresh.fresh else \
-            f"timer inactive; last sample {fresh.age_s:.0f} s old"
-    checks.append(Check(
-        "memlog", PASS if ok else FAIL, detail,
-        "" if ok else
-        f"agent-sandbox memlog install   (enables {memlog.TIMER}; a sample lands within a minute)\n"
-        f"     Launches refuse admission until the newest line of {memlog.LOG} is fresh.",
-    ))
+    checks.append(memlog_health_check(*memlog.health(cfg)))
 
     # --- admission (U7): config coherent, records honest, locks live, slice capped ---
     checks.append(admission_config_check(cfg, admission.read_state()))
@@ -406,27 +391,52 @@ def _host_checks(cfg):
     return checks
 
 
+# ---------------------------------------------------------------- memlog (R8, KTD5)
+def memlog_health_check(active, fresh):
+    """The memlog timer runs and the last sample is fresh. `active` is
+    whether the systemd user timer is active; `fresh` is the Freshness of the
+    log's last line. A launch fails closed on this log, so a stopped timer or
+    a stale line is a failed launch waiting to happen, not a warning."""
+    ok = active and fresh.fresh
+    if active and fresh.fresh:
+        detail = f"timer active, last sample {fresh.age_s:.0f} s old"
+    elif active:
+        detail = f"timer active but {fresh.reason}"
+    elif fresh.fresh:
+        detail = f"timer inactive; last sample {fresh.age_s:.0f} s old"
+    else:
+        detail = f"timer inactive; {fresh.reason}"
+    return Check(
+        "memlog", PASS if ok else FAIL, detail,
+        "" if ok else
+        f"agent-sandbox memlog install   (enables {memlog.TIMER}; a sample lands within a minute)\n"
+        f"     Launches refuse admission until the newest line of {memlog.LOG} is fresh.")
+
+
 # ---------------------------------------------------------------- disk guard (KTD11)
 def host_disk_check(cfg, read_disk_free=memlog.disk_free):
-    """The host drive backing the guest has the admission floor free. A
-    launch refuses below it, so this is a FAIL, not a warning."""
-    path = config.host_disk_path(cfg)
+    """Every path the disk guard reads (the host drive backing the guest and
+    the guest root, `memlog.disk_paths`) has the admission floor free. A
+    launch refuses when any is below it or unreadable, so this is a FAIL,
+    not a warning."""
+    paths = memlog.disk_paths(cfg)
+    path = paths[0]
     floor_gb = float(config.resolve("admission_disk_floor_gb", None, cfg))
-    free = read_disk_free([path]).get(path)
+    readings = read_disk_free(paths)
+    free_by_path = {p: readings.get(p) for p in paths}
     remedy = (
         f"Free space on {path}, the drive that holds this distro's ext4.vhdx under WSL:\n"
         "     empty the Windows recycle bin and Downloads, `agent-sandbox clean --docker`\n"
         "     (dangling images and build cache), `agent-sandbox clean` (old sandboxes).\n"
         "     Freed guest blocks only reach Windows when the vhdx is sparse; as owner:\n"
         f"     {VHDX_REMEDY}\n"
-        f"     Launches refuse admission while {path} is below {floor_gb:g} GiB.")
-    if free is None:
-        return Check("host disk", FAIL, f"{path}: free space unreadable (floor {floor_gb:g} GiB)",
-                     remedy)
-    ok = free / G >= floor_gb
+        f"     Launches refuse admission while any of {', '.join(paths)} is below {floor_gb:g} GiB.")
+    detail = ", ".join(
+        f"{p}: {'free space unreadable' if free is None else f'{free / G:.1f} GiB free'}"
+        for p, free in free_by_path.items())
+    ok = all(free is not None and free / G >= floor_gb for free in free_by_path.values())
     return Check("host disk", PASS if ok else FAIL,
-                 f"{path}: {free / G:.1f} GiB free (floor {floor_gb:g} GiB)",
-                 "" if ok else remedy)
+                 f"{detail} (floor {floor_gb:g} GiB)", "" if ok else remedy)
 
 
 def windows_path(path):
@@ -677,9 +687,7 @@ def parse_memory_max(text):
 def slice_cgroup_dir(uid=None):
     """Where the user manager keeps the slice's cgroup; absent until the
     first unit is placed in it."""
-    uid = os.getuid() if uid is None else uid
-    return (pathlib.Path("/sys/fs/cgroup/user.slice") / f"user-{uid}.slice"
-            / f"user@{uid}.service" / SLICE)
+    return config.user_manager_cgroup(SLICE, uid=uid)
 
 
 def read_slice_memory_max():

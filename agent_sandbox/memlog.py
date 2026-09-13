@@ -25,6 +25,7 @@ import time
 
 from . import config
 from .errors import SandboxError
+from .resources import ResourceConfig
 
 LOG = config.LOGS / "memory.log"
 ROTATE_AT = 20000
@@ -33,9 +34,13 @@ ROTATE_KEEP = 10000
 BOOT_ID_FILE = pathlib.Path("/proc/sys/kernel/random/boot_id")
 MEMINFO_FILE = pathlib.Path("/proc/meminfo")
 # Rootless Docker puts each container in a transient scope under the user
-# manager's slice; that is where the delegated memory controller lives.
-CGROUP_ROOT = (pathlib.Path("/sys/fs/cgroup/user.slice")
-               / f"user-{config.UID}.slice" / f"user@{config.UID}.service" / "user.slice")
+# manager's tree; that is where the delegated memory controller lives. With
+# admission off the scope sits under user.slice; with admission on every
+# managed container runs under agent-sandbox.slice (KTD8), so both roots are
+# tried before the slow `docker stats` fallback.
+CGROUP_ROOT = config.user_manager_cgroup("user.slice")
+SLICE_CGROUP_ROOT = config.user_manager_cgroup(ResourceConfig.SLICE)
+CGROUP_ROOTS = (CGROUP_ROOT, SLICE_CGROUP_ROOT)
 
 TEMPLATE_DIR = pathlib.Path(__file__).resolve().parent.parent / "templates" / "systemd"
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin" / "agent-sandbox"
@@ -160,15 +165,28 @@ def read_disk_free(cfg=None):
     return disk_free(disk_paths(cfg))
 
 
-def container_memory(containers, cgroup_root=CGROUP_ROOT, docker_stats=docker_stats):
-    """name -> bytes, from cgroup files; `docker stats` once for any that lack one."""
+def _scope_memory(cid, cgroup_roots):
+    """memory.current for `docker-<cid>.scope` under the first root that has
+    it; None when no root does."""
+    for root in cgroup_roots:
+        f = pathlib.Path(root) / f"docker-{cid}.scope" / "memory.current"
+        try:
+            return int(f.read_text().strip())
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def container_memory(containers, cgroup_roots=CGROUP_ROOTS, docker_stats=docker_stats):
+    """name -> bytes, from cgroup files under any of `cgroup_roots`;
+    `docker stats` once for any that lack one."""
     out, missing = {}, []
     for cid, name in containers:
-        f = pathlib.Path(cgroup_root) / f"docker-{cid}.scope" / "memory.current"
-        try:
-            out[name] = int(f.read_text().strip())
-        except (OSError, ValueError):
+        used = _scope_memory(cid, cgroup_roots)
+        if used is None:
             missing.append(name)
+        else:
+            out[name] = used
     if missing:
         stats = docker_stats()
         for name in missing:
@@ -217,13 +235,13 @@ def parse_line(line):
 
 # ---------------------------------------------------------------- writing
 def sample(path=LOG, *, read_boot_id=read_boot_id, read_monotonic=read_monotonic,
-           read_meminfo=read_meminfo, docker_ps=docker_ps, cgroup_root=CGROUP_ROOT,
+           read_meminfo=read_meminfo, docker_ps=docker_ps, cgroup_roots=CGROUP_ROOTS,
            docker_stats=docker_stats, now=now_iso, read_disk_free=read_disk_free):
     """Append one sample to `path`, rotating afterwards. Returns the line."""
     mem = parse_meminfo(read_meminfo())
     s = Sample(boot_id=read_boot_id(), monotonic=read_monotonic(), time=now(),
                mem_available=mem["MemAvailable"], swap_free=mem["SwapFree"],
-               containers=container_memory(docker_ps(), cgroup_root, docker_stats),
+               containers=container_memory(docker_ps(), cgroup_roots, docker_stats),
                disk_free=read_disk_free())
     line = format_line(s)
     path = pathlib.Path(path)

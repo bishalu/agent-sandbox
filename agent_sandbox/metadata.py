@@ -165,6 +165,15 @@ class RunRecord:
             self.data["containers"][-1]["status"] = "running"
         return self
 
+    def fail(self, entry_status="failed", top_status="failed"):
+        """Admission refused or timed out before any container existed:
+        the newest entry and the run itself both end here (KTD1)."""
+        if entry_status and self.data.get("containers"):
+            self.data["containers"][-1]["status"] = entry_status
+        if top_status:
+            self.data["status"] = top_status
+        return self
+
     def finish(self, exit_code, status):
         self.data["finished_at"] = _now()
         self.data["exit_code"] = exit_code

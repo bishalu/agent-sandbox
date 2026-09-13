@@ -242,7 +242,7 @@ def test_sample_records_the_injected_disk_readings(tmp_path):
                "SwapTotal:      16777216 kB\nSwapFree:       15623452 kB\n")
     memlog.sample(log, read_boot_id=lambda: BOOT, read_monotonic=lambda: 1.0,
                   read_meminfo=lambda: meminfo, docker_ps=lambda: [],
-                  cgroup_root=tmp_path / "nope", docker_stats=lambda: {},
+                  cgroup_roots=[tmp_path / "nope"], docker_stats=lambda: {},
                   now=lambda: "t", read_disk_free=lambda: {"/mnt/c": 5 * G, "/": 6 * G})
     f = memlog.parse_last_sample(log, BOOT, 2.0, max_age_s=180)
     assert f.fresh and f.sample.disk_free == {"/mnt/c": 5 * G, "/": 6 * G}
@@ -256,7 +256,8 @@ def cfg_disk(**more):
 
 
 def test_doctor_host_disk_fails_below_the_floor_with_owner_steps(clean_env):
-    c = doctor.host_disk_check(cfg_disk(), read_disk_free=lambda paths: {"/mnt/c": int(1.1 * G)})
+    c = doctor.host_disk_check(cfg_disk(),
+                               read_disk_free=lambda paths: disks(host=int(1.1 * G)))
     assert c.status == doctor.FAIL
     assert "/mnt/c" in c.detail and "1.1" in c.detail and "20" in c.detail
     assert "wsl --shutdown" in c.remedy and "--set-sparse true" in c.remedy
@@ -264,21 +265,66 @@ def test_doctor_host_disk_fails_below_the_floor_with_owner_steps(clean_env):
     assert "clean --docker" in c.remedy
 
 
-def test_doctor_host_disk_passes_above_the_floor(clean_env):
-    c = doctor.host_disk_check(cfg_disk(), read_disk_free=lambda paths: {"/mnt/c": 100 * G})
+def test_doctor_host_disk_passes_above_the_floor_listing_every_path(clean_env):
+    c = doctor.host_disk_check(cfg_disk(), read_disk_free=lambda paths: disks(host=100 * G))
     assert c.status == doctor.PASS and c.remedy == ""
-    assert "/mnt/c" in c.detail and "100" in c.detail
+    assert "/mnt/c: 100.0 GiB free" in c.detail
+    assert "/: 40.0 GiB free" in c.detail
 
 
 def test_doctor_host_disk_honours_the_configured_floor(clean_env):
     c = doctor.host_disk_check(cfg_disk(admission_disk_floor_gb=5),
-                               read_disk_free=lambda paths: {"/mnt/c": 6 * G})
+                               read_disk_free=lambda paths: disks(host=6 * G, root=6 * G))
     assert c.status == doctor.PASS
 
 
 def test_doctor_host_disk_unreadable_fails(clean_env):
-    c = doctor.host_disk_check(cfg_disk(), read_disk_free=lambda paths: {"/mnt/c": None})
-    assert c.status == doctor.FAIL and "unreadable" in c.detail
+    c = doctor.host_disk_check(cfg_disk(),
+                               read_disk_free=lambda paths: {"/mnt/c": None, "/": 40 * G})
+    assert c.status == doctor.FAIL and "/mnt/c: free space unreadable" in c.detail
+
+
+def test_doctor_host_disk_fails_when_only_the_guest_root_is_short(clean_env):
+    # Admission refuses on the guest root too; doctor must not pass a host
+    # whose launches will be refused.
+    c = doctor.host_disk_check(cfg_disk(), read_disk_free=lambda paths: disks(root=5 * G))
+    assert c.status == doctor.FAIL
+    assert "/: 5.0 GiB free" in c.detail and "/mnt/c: 100.0 GiB free" in c.detail
+    assert "wsl --shutdown" in c.remedy
+
+
+def test_doctor_host_disk_unreadable_guest_root_fails(clean_env):
+    c = doctor.host_disk_check(cfg_disk(),
+                               read_disk_free=lambda paths: {"/mnt/c": 100 * G, "/": None})
+    assert c.status == doctor.FAIL and "/: free space unreadable" in c.detail
+
+
+def test_doctor_host_disk_reads_exactly_the_paths_admission_reads(clean_env):
+    seen = []
+
+    def read(paths):
+        seen.append(list(paths))
+        return disks()
+
+    c = doctor.host_disk_check(cfg_disk(), read_disk_free=read)
+    assert c.status == doctor.PASS
+    assert seen == [memlog.disk_paths(cfg_disk())]
+    # admission.read_disk_free reads [settings.disk_path, "/"]; the same set.
+    assert set(seen[0]) == {settings().disk_path, "/"}
+
+
+def test_doctor_host_disk_off_wsl_reads_the_root_once(clean_env, monkeypatch):
+    monkeypatch.setattr(config, "read_proc_version", lambda: PLAIN_VERSION)
+    seen = []
+
+    def read(paths):
+        seen.append(list(paths))
+        return {"/": 40 * G}
+
+    c = doctor.host_disk_check({}, read_disk_free=read)
+    assert c.status == doctor.PASS
+    assert seen == [["/"]]
+    assert c.detail.startswith("/: 40.0 GiB free")
 
 
 # ---------------------------------------------------------------- doctor: vhdx sparse

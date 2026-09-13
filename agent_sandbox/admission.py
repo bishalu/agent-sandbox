@@ -298,10 +298,8 @@ def _record(rec, decision, entry_status=None, top_status=None):
                              "numbers": decision.numbers,
                              "decided_at": datetime.datetime.now(
                                  datetime.timezone.utc).isoformat()}
-    if entry_status and rec.data.get("containers"):
-        rec.data["containers"][-1]["status"] = entry_status
-    if top_status:
-        rec.data["status"] = top_status
+    if entry_status or top_status:
+        rec.fail(entry_status=entry_status, top_status=top_status)
     rec.save()
 
 

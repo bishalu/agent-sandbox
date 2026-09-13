@@ -15,7 +15,7 @@ import pytest
 
 from agent_sandbox import admission, cli, config, memlog, resources
 from agent_sandbox.backend import SandboxSpec
-from agent_sandbox.errors import AdmissionRefused, AdmissionTimeout
+from agent_sandbox.errors import AdmissionRefused, AdmissionTimeout, SandboxError
 from agent_sandbox.metadata import RunRecord
 
 G = 1024 ** 3
@@ -512,3 +512,27 @@ def test_install_sets_the_slice_memory_max_and_records_it(home):
     assert state["memory_max"] == 16 * G and state["ok"] is True
     assert admission.state_file() == home / "runs" / ".admission-state.json"
     assert json.loads(admission.state_file().read_text())["memory_max"] == 16 * G
+
+
+def test_install_records_a_failed_systemctl_before_raising(home):
+    def run(args):
+        return subprocess.CompletedProcess(args, 1, "", "Failed to set unit properties")
+
+    with pytest.raises(SandboxError) as e:
+        admission.install(16 * G, run=run)
+    assert "Failed to set unit properties" in e.value.message
+    state = json.loads(admission.state_file().read_text())
+    assert state["ok"] is False
+    assert state["memory_max"] == 16 * G
+    assert "Failed to set unit properties" in state["output"]
+
+
+def test_install_records_a_missing_systemctl_before_raising(home):
+    def run(args):
+        raise FileNotFoundError("systemctl")
+
+    with pytest.raises(SandboxError):
+        admission.install(16 * G, run=run)
+    state = json.loads(admission.state_file().read_text())
+    assert state["ok"] is False
+    assert "systemctl" in state["output"]

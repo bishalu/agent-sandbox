@@ -22,7 +22,7 @@ import sys
 
 import pytest
 
-from agent_sandbox import admission, config, doctor
+from agent_sandbox import admission, config, doctor, memlog
 from agent_sandbox.metadata import RunRecord
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures" / "runs"
@@ -220,6 +220,44 @@ def test_project_locks_pid_probe_is_injected(tmp_path):
     (lock_dir / "milestone-abc.lock").write_text("424242 note\n")
     assert doctor.project_locks_check(lock_dir, pid_alive=lambda p: True).status == doctor.PASS
     assert doctor.project_locks_check(lock_dir, pid_alive=lambda p: False).status == doctor.FAIL
+
+
+# ---------------------------------------------------------------- memlog
+def _fresh():
+    return memlog.Freshness(True, "fresh", 42.0, None)
+
+
+def _stale():
+    return memlog.Freshness(False, "last sample is 900 s old, over the 180 s maximum", 900.0, None)
+
+
+def test_memlog_active_and_fresh_passes_with_the_age():
+    c = doctor.memlog_health_check(True, _fresh())
+    assert c.status == doctor.PASS and c.remedy == ""
+    assert c.detail == "timer active, last sample 42 s old"
+
+
+def test_memlog_active_but_stale_fails_with_the_reason():
+    c = doctor.memlog_health_check(True, _stale())
+    assert c.status == doctor.FAIL
+    assert c.detail == "timer active but last sample is 900 s old, over the 180 s maximum"
+    assert "agent-sandbox memlog install" in c.remedy and memlog.TIMER in c.remedy
+
+
+def test_memlog_inactive_with_a_fresh_sample_fails_naming_the_age():
+    # The last line is fresh because the timer only just stopped; still a
+    # FAIL, because the next launch after 180 s will be refused.
+    c = doctor.memlog_health_check(False, _fresh())
+    assert c.status == doctor.FAIL
+    assert c.detail == "timer inactive; last sample 42 s old"
+    assert "agent-sandbox memlog install" in c.remedy
+
+
+def test_memlog_inactive_and_stale_fails_with_the_reason():
+    c = doctor.memlog_health_check(False, _stale())
+    assert c.status == doctor.FAIL
+    assert c.detail == "timer inactive; last sample is 900 s old, over the 180 s maximum"
+    assert str(memlog.LOG) in c.remedy
 
 
 # ---------------------------------------------------------------- slice memory.max
