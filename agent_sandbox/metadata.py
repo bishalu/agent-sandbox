@@ -8,12 +8,19 @@ lock is needed (R-13).
 import datetime
 import json
 import os
+import pathlib
 
 from . import config
 
 
 def _now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _write_atomic(path, data):
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, path)
 
 
 class RunRecord:
@@ -73,20 +80,22 @@ class RunRecord:
             "stdout": str(self.stdout_log),
             "stderr": str(self.stderr_log),
         }
-        tmp = self.file.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self.data, indent=2) + "\n")
-        os.replace(tmp, self.file)
+        _write_atomic(self.file, self.data)
         return self
 
     @classmethod
     def load(cls, sandbox_id):
-        path = config.RUNS / sandbox_id / "run.json"
-        if not path.exists():
-            return None
+        return cls.load_path(config.RUNS / sandbox_id / "run.json")
+
+    @classmethod
+    def load_path(cls, path):
+        """A record by its run.json path; None when missing or unreadable."""
+        path = pathlib.Path(path)
         try:
-            return cls(sandbox_id, json.loads(path.read_text()))
+            data = json.loads(path.read_text())
         except (ValueError, OSError):
             return None
+        return cls(data.get("sandbox_id") or path.parent.name, data)
 
     @classmethod
     def all(cls):
@@ -161,6 +170,40 @@ class RunRecord:
         self.data["exit_code"] = exit_code
         self.data["status"] = status
         return self
+
+    # -- guarded write-back (R7, KTD4) -----------------------------------
+    def mark_entries(self, fields_by_index, status=None):
+        """Set fields on container entries, and optionally the top-level
+        status, through the re-read guard.
+
+        Two writers share this file: the live sandbox process (plain atomic
+        rename, no version check) and the reconciliation. So this re-reads the
+        record immediately before writing and abandons the write when any
+        entry it would change, or the top-level status when it would change
+        that, differs from what this record read. Returns True when written,
+        False when abandoned; on success this record's data follows the file.
+        """
+        fresh = self.load_path(self.file)
+        if fresh is None:
+            return False
+        mine = self.data.get("containers") or []
+        theirs = fresh.data.get("containers") or []
+        for i in fields_by_index:
+            if i >= len(mine) or i >= len(theirs) or mine[i] != theirs[i]:
+                return False
+        if status is not None and fresh.data.get("status") != self.data.get("status"):
+            return False
+        for i, fields in fields_by_index.items():
+            theirs[i].update(fields)
+        if status is not None:
+            fresh.data["status"] = status
+        _write_atomic(self.file, fresh.data)
+        self.data = fresh.data
+        return True
+
+    def mark_entry(self, index, **fields):
+        """One entry's fields through the same guard."""
+        return self.mark_entries({index: fields})
 
     def public(self):
         """The structured result emitted by --json (R-09)."""

@@ -15,7 +15,7 @@ import re
 import sys
 
 from . import (admission, agent_home, cleanup, config, credentials, doctor, gitdir,
-               memlog, plugins, image, mounts, resources, worktree)
+               memlog, plugins, image, mounts, resources, state, worktree)
 from .backend import SandboxSpec
 from .docker_backend import LocalDockerBackend
 from .errors import AdmissionRefused, AdmissionTimeout, SandboxError
@@ -386,6 +386,77 @@ def cmd_list(args):
     return 0
 
 
+# ---------------------------------------------------------------- status
+def _status_probes():
+    """The two live readings `status` derives from: one `docker ps -a` over
+    our label answers container_exists for every entry, and os.kill(pid, 0)
+    answers pid_alive. Preflight first, so a daemon that is down is an error
+    with a remedy, never "every container is gone" (R7)."""
+    backend = LocalDockerBackend()
+    backend.preflight()
+    names = {row["name"] for row in backend.list_containers()}
+    return names.__contains__, state.pid_alive
+
+
+def cmd_status(args):
+    recs = RunRecord.all()
+    if args.sandbox_id:
+        wanted = set(args.sandbox_id)
+        recs = [r for r in recs if r.sandbox_id in wanted]
+        missing = wanted - {r.sandbox_id for r in recs}
+        if missing:
+            return _fail(SandboxError(f"no such sandbox: {', '.join(sorted(missing))}",
+                                      f"{PROG} list shows every sandbox id"))
+    container_exists, pid_alive = _status_probes()
+    settings = admission.resolve_settings(config.load_config())
+    probes = dict(container_exists=container_exists, pid_alive=pid_alive,
+                  wait_timeout_s=settings.wait_timeout_s,
+                  wait_interval_s=settings.wait_interval_s)
+
+    rows = []
+    for rec in recs:
+        derived = state.derive_record(rec, **probes)
+        reconciled = None
+        if args.reconcile and derived.changed:
+            reconciled = state.reconcile(rec.file, **probes)
+            fresh = RunRecord.load_path(rec.file)
+            if fresh is not None:
+                rec = fresh
+                derived = state.derive_record(rec, **probes)
+        d = rec.data
+        row = derived.to_dict(rec)
+        row.update({
+            "tags": d.get("tags") or {},
+            "workspace": d.get("workspace"),
+            "branch": d.get("branch"),
+            "logs": d.get("logs"),
+            "reconciled": reconciled.to_dict() if reconciled else None,
+        })
+        rows.append(row)
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no sandboxes")
+        return 0
+    print(f"{'SANDBOX ID':<28} {'STATE':<9} {'NEWEST':<10} {'FIX':>3}  {'TAGS':<22} EVIDENCE")
+    for row in rows:
+        newest = row["newest"] or {}
+        tags = ",".join(f"{k}={v}" for k, v in sorted(row["tags"].items())) or "-"
+        fix = row["corrections"]
+        if row["reconciled"]:
+            fix = f"{len(row['reconciled']['corrected'])}w" if row["reconciled"]["written"] else "!"
+        print(f"{row['sandbox_id']:<28} {row['state']:<9} {(newest.get('status') or '-'):<10} "
+              f"{str(fix):>3}  {tags[:22]:<22} {newest.get('evidence') or '-'}")
+    if any(r["corrections"] and not r["reconciled"] for r in rows) and not args.reconcile:
+        _eprint(f"[{PROG}] FIX counts stale entries; {PROG} status --reconcile corrects them")
+    for r in rows:
+        if r["reconciled"] and not r["reconciled"]["written"]:
+            _eprint(f"[{PROG}] {r['sandbox_id']}: not written: {r['reconciled']['reason']}")
+    return 0
+
+
 # ---------------------------------------------------------------- rm
 def cmd_rm(args):
     try:
@@ -637,6 +708,7 @@ def build_parser():
   {PROG} . -- npm test              one-shot command
   {PROG} . --direct -- pytest       operate on the live checkout (locked)
   {PROG} list                       show sandboxes
+  {PROG} status --json              derived state of every container entry
   {PROG} enter app-1a2b3c4d         reopen an existing workspace
   {PROG} clean --docker             sweep old sandboxes and docker junk
 """)
@@ -699,6 +771,15 @@ def build_parser():
     sp = sub.add_parser("list", help="list sandboxes")
     sp.add_argument("--json", action="store_true")
 
+    sp = sub.add_parser("status", help="the derived state of every sandbox's containers")
+    sp.add_argument("sandbox_id", nargs="*",
+                    help="only these sandboxes (default: all)")
+    sp.add_argument("--reconcile", action="store_true",
+                    help="write the corrections (crashed / orphaned entries and the "
+                         "top-level status) back to run.json, guarded against a "
+                         "record that changed under the read")
+    sp.add_argument("--json", action="store_true")
+
     sp = sub.add_parser("rm", help="remove a sandbox workspace")
     sp.add_argument("sandbox_id")
     sp.add_argument("--force", action="store_true")
@@ -751,7 +832,7 @@ def build_parser():
 
 
 KNOWN = {"run", "enter", "list", "rm", "clean", "doctor", "build", "config", "memlog",
-         "admission"}
+         "admission", "status"}
 
 
 def main(argv=None):
@@ -777,6 +858,8 @@ def main(argv=None):
             return cmd_enter(args, command)
         if args.cmd == "list":
             return cmd_list(args)
+        if args.cmd == "status":
+            return cmd_status(args)
         if args.cmd == "rm":
             return cmd_rm(args)
         if args.cmd == "clean":

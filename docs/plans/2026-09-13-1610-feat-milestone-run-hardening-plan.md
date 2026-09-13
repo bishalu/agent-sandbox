@@ -245,7 +245,7 @@ Units land in the order below; U3 first so the instrument that decides the crash
   - Entry running, container exists, pid dead: orphaned.
   - Entry waiting, no container: waiting; entry waiting older than the wait timeout plus one interval with no container: crashed.
   - Entry finished: finished.
-  - Record whose newest entry is failed and whose earlier entries are stale running: sandbox state finished, seven entries corrected to crashed (the `vibeset-dj-0439a7a7` fixture).
+  - Record whose newest entry is failed and whose earlier entries are stale running: sandbox state finished, six entries corrected to crashed (the `vibeset-dj-0439a7a7` fixture).
   - Record whose only entry is running with no container: sandbox state crashed (the `vibeset-dj-ecfa0e5c` fixture).
   - Reconciliation writes once; a second derive on the same record is idempotent.
   - The record changes between read and write: the reconciliation writes nothing and reports the fresh state.
@@ -320,7 +320,7 @@ Units land in the order below; U3 first so the instrument that decides the crash
 | Driver | `bash skill/run-milestones.test.sh` | U5 |
 | Live host | `agent-sandbox doctor` all green, including the slice probe | U3, U4, U7 |
 | Chaos | `scripts/chaos-check.sh` exits 0 | U1, U2, U5, U7 |
-| Real dead sandboxes | `run-milestones.sh resume` lists `vibeset-dj-ecfa0e5c` as vanished with its finishing command and omits `vibeset-dj-0439a7a7`, whose record `agent-sandbox status` shows as finished with seven entries corrected to crashed | U2, U5 |
+| Real dead sandboxes | `run-milestones.sh resume` lists `vibeset-dj-ecfa0e5c` as vanished with its finishing command and omits `vibeset-dj-0439a7a7`, whose record `agent-sandbox status` shows as finished with six entries corrected to crashed | U2, U5 |
 | Hypothesis check | the memory log spanning the next full milestone run records its minimum `MemAvailable`, and the milestone report states whether it approached the floor | U3 |
 
 No unit in this plan calls a model or spends money; nothing here needs Bedrock.

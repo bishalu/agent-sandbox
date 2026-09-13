@@ -9,7 +9,7 @@ import datetime
 import shutil
 import subprocess
 
-from . import config, worktree
+from . import config, state, worktree
 from .metadata import RunRecord
 
 
@@ -32,8 +32,27 @@ def age_days(rec):
     return (now - then).total_seconds() / 86400.0
 
 
-def survey(older_than_days=14):
-    """Classify sandboxes into removable / protected without deleting anything."""
+def managed_container_names():
+    """Every container carrying this tool's label, in one docker call."""
+    p = _docker(["ps", "-a", "--filter", f"label={config.LABEL_MANAGED}=true",
+                 "--format", "{{.Names}}"])
+    if p.returncode != 0:
+        return set()
+    return {l.strip() for l in p.stdout.splitlines() if l.strip()}
+
+
+def survey(older_than_days=14, container_exists=None, pid_alive=None):
+    """Classify sandboxes into removable / protected without deleting anything.
+
+    `status` is the derived top-level status and `state` the derived sandbox
+    state (state.derive_record), not what run.json happens to say: a record
+    a dead launcher left at running reads as crashed here. The probes are
+    injectable; by default one `docker ps` and os.kill(pid, 0) answer them.
+    """
+    if container_exists is None:
+        names = managed_container_names()
+        container_exists = names.__contains__
+    pid_alive = pid_alive or state.pid_alive
     removable, protected, young = [], [], []
     for rec in RunRecord.all():
         sid = rec.sandbox_id
@@ -42,8 +61,10 @@ def survey(older_than_days=14):
         if kind == "direct":
             continue                       # nothing of ours to remove
         age = age_days(rec)
+        derived = state.derive_record(rec, container_exists, pid_alive)
         info = {"id": sid, "age_days": round(age, 1), "path": path,
-                "branch": rec.data.get("branch"), "status": rec.data.get("status")}
+                "branch": rec.data.get("branch"), "status": derived.status,
+                "state": derived.state}
         if age < older_than_days:
             young.append(info)
             continue
