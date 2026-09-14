@@ -112,6 +112,14 @@ RUN printf '%s\n' \
     && printf '\n. /etc/profile.d/agent-sandbox-dotenv.sh\n' >> /root/.bashrc
 
 # Unprivileged user available on request. uid 1000 matches the common host uid.
+# Playwright's Chromium and its system libraries, for frontend milestones that
+# measure their exit criteria in a browser (vibeset-dj demo, appendix 10 item 3).
+# Installed system-wide before the agent user exists, so every user finds it.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN npx --yes playwright@latest install --with-deps chromium \
+    && chmod -R a+rX /opt/playwright \
+    && npm cache clean --force
+
 RUN useradd -m -u 1000 -s /bin/bash agent || true
 
 # Git needs to trust a bind-mounted worktree owned by a different uid mapping.
