@@ -118,3 +118,13 @@ def test_flock_release_is_idempotent(tmp_path):
     f.acquire()
     f.release()
     f.release()
+
+
+def test_remove_refuses_an_empty_or_pathlike_id(tmp_path, monkeypatch):
+    from agent_sandbox import worktree
+    from agent_sandbox.errors import WorktreeError
+    import pytest
+    for bad in ("", " ", "../x", "a/b", "/", ".."):
+        with pytest.raises(WorktreeError):
+            worktree.remove(bad, force=True)
+    assert worktree.require_sandbox_id("vibeset-dj-1a2b3c4d") == "vibeset-dj-1a2b3c4d"

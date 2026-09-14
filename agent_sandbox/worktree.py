@@ -267,9 +267,30 @@ def unpushed_commits(path):
     return len([l for l in p.stdout.splitlines() if l.strip()])
 
 
+SANDBOX_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def require_sandbox_id(sandbox_id):
+    """One id names one sandbox. An empty id once resolved `RUNS / ""` and
+    `WORKTREES / ""` to the roots themselves and rm --force emptied both
+    (2026-09-14), so an id must be a single non-empty path segment."""
+    if not isinstance(sandbox_id, str) or not SANDBOX_ID_RE.match(sandbox_id) or ".." in sandbox_id:
+        raise WorktreeError(
+            f"not a sandbox id: {sandbox_id!r}",
+            "Pass one id as `agent-sandbox list` prints it, for example vibeset-dj-1a2b3c4d.",
+        )
+    return sandbox_id
+
+
+def _inside(path, root):
+    path, root = pathlib.Path(path).resolve(), pathlib.Path(root).resolve()
+    return path != root and root in path.parents
+
+
 def remove(sandbox_id, force=False):
     """Remove a sandbox workspace. Refuses to discard work unless forced."""
     from .metadata import RunRecord
+    require_sandbox_id(sandbox_id)
     rec = RunRecord.load(sandbox_id)
     path = pathlib.Path(rec.data["workspace"]) if rec and rec.data.get("workspace") else \
         config.WORKTREES / sandbox_id
@@ -291,6 +312,11 @@ def remove(sandbox_id, force=False):
             shutil.rmtree(run_dir, ignore_errors=True)
         return True
 
+    if not _inside(path, config.WORKTREES) and kind == "worktree":
+        raise WorktreeError(
+            f"refusing to remove {path}: not a sandbox worktree under {config.WORKTREES}",
+            "The record's workspace path is outside the worktrees directory; inspect it by hand.",
+        )
     if path.exists() and not force:
         dirty = has_uncommitted_work(path)
         ahead = unpushed_commits(path)
