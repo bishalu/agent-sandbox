@@ -61,6 +61,8 @@ Hardening on every run: rootless Docker only, `no-new-privileges`, all capabilit
 
 Defaults: 8 CPUs, 16g, 2048 PIDs, 12h timeout, full network. Override per run with a flag, or persistently in `~/agent-sandbox/config.json`. On timeout the container gets SIGTERM and 30 seconds to close its traces, then SIGKILL. The workspace is kept.
 
+With admission on, a run starts only when the host's memory budget and disk floor allow it, and a run tagged `--tag milestone=<n>` also holds one milestone lock per repository and lane. `--tag lane=<name>` picks the lane (default `main`): milestones in different lanes run together, and milestones in one lane queue.
+
 ## Setup
 
 Rootless Docker, no `docker` group, rootful daemon off:
