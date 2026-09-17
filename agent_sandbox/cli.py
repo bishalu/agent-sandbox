@@ -200,9 +200,12 @@ def cmd_run(args, command):
     try:
         # Gitignored secrets the repo keeps beside its code (R-23). Done first:
         # a seed failure must leave a sandbox that `list` and `rm` can see.
-        seeded, seed_warnings = worktree.seed(
-            ws, config.resolve("worktree_seed", None, cfg))
-        rec.update(seeded=seeded).save()
+        seed = worktree.seed(ws, config.resolve("worktree_seed", None, cfg),
+                             manifest=rec.dir / worktree.SEED_MANIFEST)
+        seeded, seed_warnings = seed
+        # Files kept because the run changed them: evidence from this
+        # worktree is not a clean copy of the host (plan U10 / R26).
+        rec.update(seeded=seeded, seed_kept=seed.kept).save()
 
         img = config.resolve("image", args.image, cfg)
         image.ensure(img, quiet=bool(args.json), force=args.force_build)
@@ -319,9 +322,12 @@ def cmd_enter(args, command):
 
     # Gitignored secrets are refreshed from the source checkout on every
     # start, so a key rotated on the host reaches a resumed sandbox (R-23).
-    seeded, seed_warnings = worktree.seed(
-        ws, config.resolve("worktree_seed", None, cfg))
-    rec.update(seeded=seeded).save()
+    seed = worktree.seed(ws, config.resolve("worktree_seed", None, cfg),
+                         manifest=rec.dir / worktree.SEED_MANIFEST)
+    seeded, seed_warnings = seed
+    # Files kept because the run changed them: evidence from this
+    # worktree is not a clean copy of the host (plan U10 / R26).
+    rec.update(seeded=seeded, seed_kept=seed.kept).save()
 
     # Same helper as `run`: an existing home is never re-seeded, only
     # checked against the current image (R-18). Plugins are re-mirrored.

@@ -7,6 +7,9 @@ nested worktrees confuse tools that walk upward looking for a repo root.
 Central storage keeps the source repo untouched.
 """
 
+import hashlib
+import json
+import os
 import pathlib
 import re
 import secrets
@@ -162,11 +165,66 @@ def create(target, sandbox_id=None, direct=False):
     return Workspace(sid, dest, "copy", repo=target)
 
 
-def seed(ws, paths):
+SEED_MANIFEST = "seed-manifest.json"
+
+
+class SeedResult(tuple):
+    """(copied, warnings), so `copied, warnings = seed(...)` keeps working,
+    plus `.kept`: the repo-relative files left alone because the run changed
+    them. A gate reads `.kept` to mark evidence from this worktree dirty."""
+
+    def __new__(cls, copied, warnings, kept):
+        self = super().__new__(cls, (copied, warnings))
+        self.kept = kept
+        return self
+
+    @property
+    def copied(self):
+        return self[0]
+
+    @property
+    def warnings(self):
+        return self[1]
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _seed_files(src, rel):
+    """(source file, repo-relative posix path) for every file under a seed entry.
+    Symlinks in the source are followed, as the copy always did."""
+    if not src.is_dir():
+        yield src, rel
+        return
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=True):
+        dirnames.sort()
+        base = pathlib.Path(dirpath)
+        for name in sorted(filenames):
+            f = base / name
+            yield f, str(pathlib.PurePosixPath(rel) / f.relative_to(src).as_posix())
+
+
+def _load_manifest(path):
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}              # unreadable: treat every existing copy as unrecorded
+    files = data.get("files") if isinstance(data, dict) else None
+    return files if isinstance(files, dict) else {}
+
+
+def seed(ws, paths, manifest=None):
     """Copy gitignored paths from the source checkout into a worktree (R-23).
 
-    Runs on creation and again on every `enter`, overwriting the copies, so the
-    host checkout stays the source of truth for secrets.
+    Runs on creation and again on every `enter`, so the host checkout stays the
+    source of truth for secrets: a key rotated on the host reaches the sandbox.
 
     `git worktree add` gives a worktree the tracked files only, so the secrets a
     repo keeps in a gitignored `.env` never arrive on their own and an agent
@@ -179,11 +237,21 @@ def seed(ws, paths):
     source are skipped (a repo without a `.env` has nothing to seed). Copies
     preserve permissions, so a 0600 `.env` stays 0600.
 
-    Returns (copied, warnings): the relative paths copied, and one warning per
-    entry that was present but not gitignored.
+    A refresh never overwrites what the run changed. Each copy's sha256 is
+    recorded per file in `manifest` (default runs/<id>/seed-manifest.json,
+    never inside the worktree, where it could be committed). On a later seed a
+    file is copied when its worktree copy is missing or still matches the
+    record; otherwise the run changed it (or replaced it with a symlink or
+    directory), so it is kept and a warning names the path, never its
+    contents. Directories follow the rule per file; files only the worktree
+    has are left alone. With no manifest at all, everything is copied.
+
+    Returns a SeedResult: unpacks to (copied, warnings), the seed entries at
+    least one of whose files is in place from the source and one warning per
+    non-gitignored or kept path; `.kept` lists the kept files.
     """
     if not paths:
-        return [], []
+        return SeedResult([], [], [])
     if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
         raise WorktreeError(
             "worktree_seed in config.json must be a list of repo-relative paths, "
@@ -191,9 +259,20 @@ def seed(ws, paths):
             'Example: "worktree_seed": [".env", "secrets"]',
         )
     if ws.kind != "worktree" or not ws.repo:
-        return [], []
+        return SeedResult([], [], [])
     root = pathlib.Path(ws.repo)
-    copied, warnings = [], []
+    manifest = pathlib.Path(manifest) if manifest else \
+        config.RUNS / require_sandbox_id(ws.sandbox_id) / SEED_MANIFEST
+    wt = ws.path.resolve()
+    if manifest.resolve() == wt or wt in manifest.resolve().parents:
+        raise WorktreeError(
+            f"seed manifest {manifest} is inside the worktree {ws.path}",
+            "Keep the manifest in the sandbox's run directory, where it cannot be committed.",
+        )
+    recorded = _load_manifest(manifest)
+    first = recorded is None
+    recorded = dict(recorded or {})
+    copied, warnings, kept = [], [], []
     for raw in paths:
         rel = raw.strip().strip("/")
         parts = pathlib.PurePosixPath(rel).parts
@@ -212,14 +291,42 @@ def seed(ws, paths):
                 "(a tracked path is already in the worktree, and an untracked one "
                 "would be committed from inside the sandbox)")
             continue
-        dest = ws.path / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if src.is_dir():
-            shutil.copytree(src, dest, symlinks=False, dirs_exist_ok=True)
-        else:
-            shutil.copy2(src, dest)
-        copied.append(rel)
-    return copied, warnings
+        placed = False
+        for src_file, frel in _seed_files(src, rel):
+            dest = ws.path / frel
+            if not _within(wt, dest.parent):
+                changed = True            # a parent was swapped for a link out of the worktree
+            elif dest.is_symlink() or dest.exists():
+                if dest.is_symlink() or not dest.is_file():
+                    changed = True        # never write through a link or over a directory
+                elif first:
+                    changed = False
+                else:
+                    have = _sha256(dest)
+                    changed = have != recorded.get(frel) and have != _sha256(src_file)
+            else:
+                changed = False
+            if changed:
+                kept.append(frel)
+                warnings.append(f"worktree_seed: kept run-modified seed path {frel}")
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_file, dest)
+            recorded[frel] = _sha256(dest)
+            placed = True
+        if placed:
+            copied.append(rel)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = manifest.with_name(manifest.name + ".tmp")
+    tmp.write_text(json.dumps({"version": 1, "files": recorded}, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, manifest)
+    return SeedResult(copied, warnings, kept)
+
+
+def _within(top, d):
+    """`d` (existing or not) resolves to `top` or below it."""
+    real = pathlib.Path(d).resolve()
+    return real == top or top in real.parents
 
 
 def reopen(sandbox_id):
