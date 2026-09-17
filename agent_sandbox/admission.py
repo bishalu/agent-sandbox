@@ -14,7 +14,9 @@ nor escapes it.
 sees the new container in `docker inspect` (or thirty seconds pass), so two
 launchers cannot both pass on one stale snapshot. The per-project milestone
 lock is a second, longer lock, taken only for a run tagged `milestone` and
-released when that run returns.
+released when that run returns. It is keyed by repository and `lane` tag
+(default `main`), so milestones in different lanes run together while one
+lane stays serial.
 
 Disk is a refusal, never a wait (KTD11): the host drive backing the guest
 (under WSL the Windows drive holding ext4.vhdx) or the guest root below the
@@ -32,9 +34,11 @@ import time
 
 from . import config, locks, memlog, metadata, resources
 from .errors import AdmissionRefused, AdmissionTimeout, SandboxError
+from .worktree import SANDBOX_ID_RE
 
 ADMISSION_LOCK = "admission.lock"
 VISIBLE_TIMEOUT_S = 30.0
+DEFAULT_LANE = "main"
 UNLIMITED_FACTOR = 1.25
 
 G = 1024 ** 3
@@ -119,13 +123,14 @@ def committed_memory(inspect_rows, memlog_sample, budget):
 
 
 def decide(request, committed, mem_available, memlog_sample, project_locked, cfg,
-           request_source="config", disk_free=None):
+           request_source="config", disk_free=None, lane=DEFAULT_LANE):
     """admit, wait or refuse, with reasons and the effective numbers.
 
     `memlog_sample` is the `memlog.Freshness` the launcher read; a stale one
     refuses (fail closed, KTD5). `project_locked` is None for an untagged run
     (not checked), False when the tagged run's project lock is free, or the
-    holder's pid. `disk_free` maps each path the launcher read (the host
+    holder's pid; `lane` names which of the repository's milestone locks
+    that is. `disk_free` maps each path the launcher read (the host
     drive backing the guest and the guest root) to its free bytes, None when
     the path could not be read; any reading below the disk floor, or
     unreadable, refuses (KTD11). None means the caller took no disk readings
@@ -145,7 +150,7 @@ def decide(request, committed, mem_available, memlog_sample, project_locked, cfg
                    "source": "live: memory log"},
     }
     if project_locked is not None:
-        numbers["project_lock"] = {"held": bool(project_locked),
+        numbers["project_lock"] = {"held": bool(project_locked), "lane": lane,
                                    "pid": project_locked or None, "source": "live: lock file"}
     if disk_free is not None:
         numbers["disk_floor"] = {"bytes": cfg.disk_floor,
@@ -171,7 +176,7 @@ def decide(request, committed, mem_available, memlog_sample, project_locked, cfg
     if mem_available < cfg.floor:
         wait.append(f"MemAvailable {fmt(mem_available)} below floor {fmt(cfg.floor)}")
     if project_locked:
-        wait.append(f"project lock held by pid {project_locked}")
+        wait.append(f"project lock held by pid {project_locked} (lane {lane})")
     return Decision("wait" if wait else "admit", wait, numbers)
 
 
@@ -225,9 +230,24 @@ def state_file():
     return config.RUNS / ".admission-state.json"
 
 
-def project_lock_path(repo, lock_dir=None):
+def require_lane(lane):
+    """A lane lands in a lock file name, so it must be one safe path segment:
+    the sandbox id rule. An explicit empty `--tag lane=` is refused rather
+    than read as the default, since it is more likely a missing value."""
+    if not isinstance(lane, str) or not SANDBOX_ID_RE.match(lane) or ".." in lane:
+        raise SandboxError(
+            f"not a lane: {lane!r}",
+            "Pass --tag lane=<name> with letters, digits, '.', '_' or '-', starting "
+            f"with a letter or digit, or omit the tag for the {DEFAULT_LANE!r} lane.")
+    return lane
+
+
+def project_lock_path(repo, lock_dir=None, lane=DEFAULT_LANE):
+    """One milestone lock per repository and lane. The default lane keeps the
+    pre-lane name, so a lock held across the upgrade still counts."""
     h = locks.repo_hash(repo)
-    return (config.LOCK_DIR if lock_dir is None else lock_dir) / f"milestone-{h}.lock"
+    suffix = "" if require_lane(lane) == DEFAULT_LANE else f"-{lane}"
+    return (config.LOCK_DIR if lock_dir is None else lock_dir) / f"milestone-{h}{suffix}.lock"
 
 
 # ---------------------------------------------------------------- the handle
@@ -287,7 +307,9 @@ def describe(decision):
     if "disk_floor" in n:
         parts.append(f"disk_floor={fmt(n['disk_floor']['bytes'])} ({n['disk_floor']['source']})")
     if "project_lock" in n:
-        parts.append("project_lock=" + ("held" if n["project_lock"]["held"] else "free"))
+        pl = n["project_lock"]
+        parts.append(f"project_lock={'held' if pl['held'] else 'free'} "
+                     f"(lane {pl.get('lane', DEFAULT_LANE)})")
     return " ".join(parts)
 
 
@@ -325,10 +347,12 @@ def acquire(spec, cfg=None, *, force=False, wait=True, quiet=False,
     request = spec.resources.memory_bytes
     request_source = getattr(spec.resources, "memory_source", "config")
     project_lock = None
+    lane = DEFAULT_LANE
     if "milestone" in tags:
+        lane = require_lane(tags.get("lane", DEFAULT_LANE))
         repo = spec.workspace.repo or str(spec.workspace.path)
-        project_lock = locks.PidLock(project_lock_path(repo, lock_dir),
-                                     note=f"milestone {tags['milestone']} {repo}")
+        project_lock = locks.PidLock(project_lock_path(repo, lock_dir, lane),
+                                     note=f"milestone {tags['milestone']} lane {lane} {repo}")
 
     flock = locks.FileFlock(lock_dir / ADMISSION_LOCK)
     started = now()
@@ -344,7 +368,8 @@ def acquire(spec, cfg=None, *, force=False, wait=True, quiet=False,
             fresh = read_memlog(cfg)
             committed = committed_memory(inspect_running(), fresh.sample, cfg.budget)
             decision = decide(request, committed, read_mem_available(), fresh, locked, cfg,
-                              request_source=request_source, disk_free=read_disk_free(cfg))
+                              request_source=request_source, disk_free=read_disk_free(cfg),
+                              lane=lane)
             if decision.verdict == "admit":
                 if project_lock is not None:
                     project_lock.acquire()

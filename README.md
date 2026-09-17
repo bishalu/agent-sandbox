@@ -19,7 +19,7 @@ No per-repository setup, and no assumptions about language or test runner.
 
 **The sandbox remembers.** Each one keeps its own Claude home, so `agent-sandbox .` followed by `claude --resume` picks up the conversation you left. It resumes the same sandbox every time until you ask for `--new`.
 
-**Secrets arrive on their own.** A worktree starts with tracked files only. List your gitignored `.env` under `worktree_seed` in the config and every new sandbox gets a copy, permissions intact. Only gitignored paths are copied, so nothing can end up in a commit.
+**Secrets arrive on their own.** A worktree starts with tracked files only. List your gitignored `.env` under `worktree_seed` in the config and every new sandbox gets a copy, permissions intact. Only gitignored paths are copied, so nothing can end up in a commit. Each start refreshes the copies from the host, so a rotated key arrives, unless the run changed a copy: that file is kept and named in a warning (never its contents). The record of what was copied lives in the run directory, outside the worktree.
 
 **Git works inside.** Commit, branch, rebase, stash, all on the sandbox branch. Push is denied for the Claude operator, and the parts of `.git` that could run code on your host the next time you type `git` are mounted read-only.
 
@@ -60,6 +60,8 @@ Hardening on every run: rootless Docker only, `no-new-privileges`, all capabilit
 | `agent-sandbox config show` | current defaults |
 
 Defaults: 8 CPUs, 16g, 2048 PIDs, 12h timeout, full network. Override per run with a flag, or persistently in `~/agent-sandbox/config.json`. On timeout the container gets SIGTERM and 30 seconds to close its traces, then SIGKILL. The workspace is kept.
+
+With admission on, a run starts only when the host's memory budget and disk floor allow it, and a run tagged `--tag milestone=<n>` also holds one milestone lock per repository and lane. `--tag lane=<name>` picks the lane (default `main`): milestones in different lanes run together, and milestones in one lane queue.
 
 ## Setup
 

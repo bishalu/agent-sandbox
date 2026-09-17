@@ -295,6 +295,67 @@ def test_dead_project_lock_holder_is_reclaimed(home):
     h.release()
 
 
+def _hand_lock_to_parent(h):
+    """Make the lock `h` took look held by a live other process (our parent),
+    then drop the flock so a second acquire in this process can decide."""
+    path = h.project_lock.path
+    path.write_text(f"{os.getppid()} " + path.read_text().split(" ", 1)[1])
+    h.flock.release()
+    return path
+
+
+def test_milestones_in_different_lanes_do_not_block_each_other(home):
+    first = _acquire(_spec(tags={"milestone": "10", "lane": "a"}, rec=RunRecord("x-1")),
+                     settings(), [])
+    held = _hand_lock_to_parent(first)
+    second = _acquire(_spec(tags={"milestone": "11", "lane": "b"}, rec=RunRecord("x-2")),
+                      settings(), [], wait=False)
+    assert second.decision.verdict == "admit"
+    assert second.project_lock.path != held
+    assert held.read_text().startswith(str(os.getppid()))
+    second.release()
+
+
+def test_milestones_in_the_same_lane_queue_and_the_reason_names_the_lane(home):
+    first = _acquire(_spec(tags={"milestone": "10", "lane": "a"}, rec=RunRecord("x-1")),
+                     settings(), [])
+    held = _hand_lock_to_parent(first)
+    assert "lane a" in held.read_text()
+    with pytest.raises(AdmissionRefused) as e:
+        _acquire(_spec(tags={"milestone": "11", "lane": "a"}, rec=RunRecord("x-2")),
+                 settings(), [], wait=False)
+    reason = next(r for r in e.value.reasons if "project lock" in r)
+    assert str(os.getppid()) in reason and "lane a" in reason
+    assert e.value.decision.numbers["project_lock"]["lane"] == "a"
+
+
+def test_milestone_without_a_lane_keeps_the_pre_lane_lock_file(home):
+    legacy = config.LOCK_DIR / f"milestone-{admission.locks.repo_hash('/repo/x')}.lock"
+    assert admission.project_lock_path("/repo/x") == legacy
+    h = _acquire(_spec(tags={"milestone": "6"}, rec=RunRecord("x-1")), settings(), [])
+    assert h.project_lock.path == legacy and legacy.exists()
+    assert "lane main" in legacy.read_text()
+    h.release()
+
+
+def test_milestone_lock_held_across_the_upgrade_still_blocks_the_main_lane(home):
+    legacy = config.LOCK_DIR / f"milestone-{admission.locks.repo_hash('/repo/x')}.lock"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(f"{os.getppid()} milestone 9 /repo/x\n")   # written by the old code
+    with pytest.raises(AdmissionRefused):
+        _acquire(_spec(tags={"milestone": "10", "lane": "main"}, rec=RunRecord("x-1")),
+                 settings(), [], wait=False)
+
+
+@pytest.mark.parametrize("lane", ["", "../x", "a/b", "..", "a..b", ".hidden"])
+def test_bad_lane_is_refused_before_any_lock_file_exists(home, lane):
+    with pytest.raises(SandboxError) as e:
+        _acquire(_spec(tags={"milestone": "10", "lane": lane}, rec=RunRecord("x-1")),
+                 settings(), [])
+    assert "lane" in e.value.message and e.value.remedy
+    assert not config.LOCK_DIR.exists() or not any(config.LOCK_DIR.iterdir())
+
+
 def test_two_launchers_serialize_on_the_flock_and_count_each_other(home):
     """The second acquire must block on the flock until the first container
     is visible, then see it in the committed total."""
