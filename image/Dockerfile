@@ -106,7 +106,9 @@ RUN test "$(claude --version | grep -o '[0-9][0-9.]*' | head -1)" = "2.1.263" \
 # docker's argument list.
 RUN printf '%s\n' \
         '# agent-sandbox: export the seeded workspace .env into every shell' \
-        'if [ -f /workspace/.env ]; then set -a; . /workspace/.env; set +a; fi' \
+        '# -r, not -f: the seeded .env is 0600 and owned by the workspace user, so a shell' \
+        '# another account opens (su postgres -c ... in a gate) must skip it, not fail on it.' \
+        'if [ -r /workspace/.env ]; then set -a; . /workspace/.env; set +a; fi' \
         > /etc/profile.d/agent-sandbox-dotenv.sh \
     && chmod 0644 /etc/profile.d/agent-sandbox-dotenv.sh \
     && printf '\n. /etc/profile.d/agent-sandbox-dotenv.sh\n' >> /root/.bashrc
